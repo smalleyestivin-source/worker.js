@@ -1,5 +1,5 @@
 {
-  "name": "uab-relay",
+  "name": "worker-js",
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
   "d1_databases": [
