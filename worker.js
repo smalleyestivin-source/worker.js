@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -620,12 +620,21 @@ async function handleAdminApi(request, env, url, segs) {
   }
 }
 
+const PREVIEW_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;background:#fff}</style></head><body><iframe id="i" sandbox="allow-scripts allow-popups allow-modals allow-forms"></iframe><script>
+var f=document.getElementById('i'),AF=Object.getPrototypeOf(async function(){}).constructor;
+addEventListener('message',function(e){var d=e.data||{};
+ if(e.source===parent){
+  if(d.t==='show')f.srcdoc=d.html||'';
+  else if(d.t==='check'){var r=[];(d.codes||[]).forEach(function(c){try{new AF(c.code)}catch(x){r.push(c.where+': '+x.message)}});parent.postMessage({t:'checked',id:d.id,errs:r},'*')}
+ } else if(d.uabErr)parent.postMessage(d,'*')});
+parent.postMessage({t:'ready'},'*');
+</scr`+`ipt></body></html>`;
 const ADMIN_HTML = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Universal AI Bridge · Panel</title>
 <style>
 :root{--bg:#0b1020;--p:#131a2e;--l:#ffffff1f;--t:#eef3ff;--m:#93a2bf;--b:#6d8cff;--g:#56d6a0;--a:#f2c16b;--r:#ff7b8a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.5 system-ui,sans-serif;padding:16px;max-width:900px;margin:0 auto}
 h1{font-size:20px;margin:6px 0 2px}h2{font-size:15px;margin:0 0 8px}p{color:var(--m);margin:0 0 12px;font-size:12px}
-.panel{background:var(--p);border:1px solid var(--l);border-radius:14px;padding:14px;margin:12px 0}
+.ok{color:var(--g);font-size:12px}.panel{background:var(--p);border:1px solid var(--l);border-radius:14px;padding:14px;margin:12px 0}
 input,select,button{font:inherit;color:inherit;background:#0e1527;border:1px solid var(--l);border-radius:10px;padding:9px 11px}
 button{cursor:pointer;background:#1b2542}button.pri{background:linear-gradient(110deg,#6685ff,#8069ef);border:0;color:#fff}button.ok{border-color:#56d6a066;color:var(--g)}button.no{border-color:#ff7b8a66;color:var(--r)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}.item{border-top:1px solid var(--l);padding:10px 0;font-size:12px;overflow-wrap:anywhere}.item:first-child{border-top:0}
@@ -649,7 +658,10 @@ pre{background:#0a0f1d;border:1px solid var(--l);border-radius:10px;padding:10px
 <h2 style="margin-top:14px">Mesa de trabajo</h2><div id="wls"></div><pre id="wview" hidden></pre><div class="row" id="wact" hidden><button id="wcp">Copiar</button><button id="wdl">Descargar</button></div></div>
 <div class="panel"><h2>Proyecto en vivo</h2><p>Qué hace cada IA ahora y los cambios que han hecho al archivo. Puedes deshacer cualquier cambio.</p>
 <h2>IAs conectadas</h2><div id="ais"></div>
-<h2 style="margin-top:14px">Archivos del proyecto</h2><div id="pjs"></div><div id="hist"></div></div>
+<h2 style="margin-top:14px">Archivos del proyecto</h2><div id="pjs"></div><div id="live" hidden><h2 style="margin-top:14px">En vivo: <span id="lname"></span></h2><p id="lst"></p>
+<div class="row"><button id="lre">Actualizar ya</button><button id="ldl">Descargar</button><button id="lcl">Cerrar</button></div>
+<div id="lchk"></div><div id="lrun"></div><iframe id="lframe" src="/admin/preview" sandbox="allow-scripts allow-popups" style="width:100%;height:340px;border:1px solid var(--l);border-radius:10px;background:#fff;margin-top:8px;display:none"></iframe>
+<pre id="lcode" hidden style="max-height:340px;overflow:auto"></pre><h2 style="margin-top:10px">Últimos cambios</h2><div id="lhist"></div></div><div id="hist"></div></div>
 <div class="panel"><h2>Enlaces activos</h2><div id="tks"></div></div>
 <div class="panel"><h2>Actividad</h2><div class="row"><button id="rf">Actualizar</button></div><div id="lgs"></div></div>
 </div>
@@ -697,11 +709,11 @@ function proj(){
   d.appendChild(el('div',(r.last_t?'Última acción: '+r.last_tool+' ('+r.last_status+') hace '+ago(r.last_t)+' · ':'')+r.calls10+' llamadas en 10 min'+(r.task?' · tarea: '+r.task:'')))})}).catch(fail);
  api('file-list').then(function(rows){fill($('#pjs'),rows,function(d,r){
   d.appendChild(el('b',r.name));d.appendChild(el('span',' versión '+r.ver+' · '+r.chars+' caracteres','tag'));
-  var w=el('div',null,'row'),b1=el('button','Descargar'),b2=el('button','Cambios'),b3=el('button','Reordenar partes');
+  var w=el('div',null,'row'),b1=el('button','Descargar'),b2=el('button','Cambios'),b3=el('button','Reordenar partes'),b4=el('button','Ver en vivo','pri');b4.onclick=function(){liveOpen(r)};
   b1.onclick=function(){api('file-get',{id:r.id}).then(function(x){dl(x.name,x.text)}).catch(function(e){alert(e.message)})};
   b2.onclick=function(){hist(r)};
   b3.onclick=function(){if(confirm('Reordena las partes del archivo. Borra el historial de cambios de este archivo. ¿Seguir?'))api('file-rebalance',{id:r.id}).then(refresh).catch(function(e){alert(e.message)})};
-  w.append(b1,b2,b3);d.appendChild(w)})}).catch(fail)}
+  w.append(b4,b1,b2,b3);d.appendChild(w)})}).catch(fail)}
 function hist(f){api('file-hist',{id:f.id}).then(function(rows){var box=$('#hist');box.replaceChildren();box.appendChild(el('h2','Cambios en '+f.name));
  if(!rows.length)box.appendChild(el('p','Todavía nadie ha editado este archivo.'));
  rows.forEach(function(r){var d=el('div',null,'item');d.appendChild(el('b','v'+r.ver+' · '+r.who+' · hace '+ago(r.t)));
@@ -709,6 +721,49 @@ function hist(f){api('file-hist',{id:f.id}).then(function(rows){var box=$('#hist
   if(r.note)d.appendChild(el('div',r.note));
   if(!r.undone){var u=el('button','Deshacer','no');u.onclick=function(){api('file-undo',{id:r.id}).then(function(){hist(f);refresh()}).catch(function(e){alert(e.message)})};d.appendChild(u)}
   box.appendChild(d)})}).catch(function(e){alert(e.message)})}
+var LIVE=null,LTIMER=null,LERR={},PREADY=false,PWAIT={},PID=0;
+function nl(){return String.fromCharCode(10)}
+function countOf(s,t){return s.split(t).length-1}
+function chk(name,text){var errs=[],codes=[],ext=name.toLowerCase().split('.').pop();
+ function js(code,where){var esm=code.split(nl()).some(function(l){l=l.trim();return l.indexOf('import ')===0||l.indexOf('export ')===0});if(!esm)codes.push({where:where,code:code})}
+ if(ext==='json'){try{JSON.parse(text)}catch(e){errs.push('JSON: '+e.message)}}
+ else if(ext==='js'||ext==='mjs'){js(text,'JavaScript')}
+ else if(ext==='html'||ext==='htm'){var i=0,n=0;
+  while(true){var a=text.indexOf('<script',i);if(a<0)break;var g=text.indexOf('>',a);if(g<0)break;var z=text.indexOf('</scr'+'ipt>',g);if(z<0){errs.push('Falta cerrar una etiqueta script');break}
+   var tag=text.slice(a,g).toLowerCase();n++;if(tag.indexOf(' src=')<0&&tag.indexOf('module')<0&&tag.indexOf('json')<0&&tag.indexOf('template')<0)js(text.slice(g+1,z),'JavaScript (script '+n+')');i=z+9}
+  var low=text.toLowerCase(),pairs=['div','span','table','ul','ol','section','button','form'];
+  pairs.forEach(function(t){var o=countOf(low,'<'+t+'>')+countOf(low,'<'+t+' '),c=countOf(low,'</'+t+'>');if(o!==c)errs.push('Etiquetas <'+t+'> abiertas: '+o+', cerradas: '+c)});
+  var s=0;while(true){var a2=low.indexOf('<style',s);if(a2<0)break;var g2=low.indexOf('>',a2),z2=low.indexOf('</style>',g2);if(z2<0)break;var css=text.slice(g2+1,z2);if(countOf(css,'{')!==countOf(css,'}'))errs.push('CSS: llaves { } no coinciden');s=z2+8}}
+ return {errs:errs,codes:codes}}
+function toPrev(m){var w=$('#lframe').contentWindow;if(w)w.postMessage(m,'*')}
+function askCheck(codes){if(!codes.length)return Promise.resolve([]);
+ return new Promise(function(ok){var id=++PID,t=setTimeout(function(){delete PWAIT[id];ok(['No pude revisar el código (visor sin respuesta).'])},6000);PWAIT[id]=function(e){clearTimeout(t);ok(e)};
+  var send=function(){toPrev({t:'check',id:id,codes:codes})};if(PREADY)send();else $('#lframe').addEventListener('load',send,{once:true})})}
+function liveClose(){LIVE=null;clearInterval(LTIMER);$('#live').hidden=true;toPrev({t:'show',html:''})}
+function liveShow(){var f=LIVE;if(!f)return;
+ api('file-get',{id:f.id}).then(function(x){f.text=x.text;var c=chk(x.name,x.text);
+  var low=x.name.toLowerCase(),isH=low.slice(-5)==='.html'||low.slice(-4)==='.htm';
+  $('#lframe').style.display=isH?'block':'none';$('#lcode').hidden=isH;
+  if(isH){LERR={};$('#lrun').replaceChildren();var hook='<scr'+'ipt>window.onerror=function(m,s,l){parent.postMessage({uabErr:m+" (línea "+l+")"},"*")};window.addEventListener("unhandledrejection",function(ev){parent.postMessage({uabErr:"Promesa rechazada: "+(ev.reason&&ev.reason.message||ev.reason)},"*")})</scr'+'ipt>';
+   var t=x.text,h=t.toLowerCase().indexOf('<head>');t=h>=0?t.slice(0,h+6)+hook+t.slice(h+6):hook+t;
+   var go=function(){toPrev({t:'show',html:t})};if(PREADY)go();else $('#lframe').addEventListener('load',go,{once:true})}
+  else{$('#lcode').textContent=x.text.slice(0,20000)+(x.text.length>20000?nl()+'… (se muestran los primeros 20000 caracteres)':'')}
+  askCheck(c.codes).then(function(extra){var all=c.errs.concat(extra),box=$('#lchk');box.replaceChildren();
+   if(all.length){all.forEach(function(m){box.appendChild(el('div','⚠ '+m,'err'))})}else{box.appendChild(el('div','✓ Sin errores de sintaxis detectados','ok'))}});
+  api('file-hist',{id:f.id}).then(function(rows){var hb=$('#lhist');hb.replaceChildren();
+   if(!rows.length)hb.appendChild(el('div','Nadie ha editado este archivo todavía.'));
+   rows.slice(0,6).forEach(function(r){hb.appendChild(el('div','v'+r.ver+' · '+r.who+' · hace '+ago(r.t)+' · '+(r.delta>=0?'+':'')+r.delta+' caracteres'+(r.undone?' (deshecho)':'')))})})
+ }).catch(function(e){$('#lchk').textContent=e.message})}
+function liveTick(){if(!LIVE||document.hidden)return;
+ api('file-list').then(function(rows){var r=rows.filter(function(x){return x.id===LIVE.id})[0];if(!r){$('#lst').textContent='El archivo ya no existe.';return}
+  if(r.ver!==LIVE.ver){LIVE.ver=r.ver;LIVE.chars=r.chars;liveShow()}
+  $('#lst').textContent='Versión '+r.ver+' · '+r.chars+' caracteres · se actualiza solo cada 5 s · revisado '+new Date().toLocaleTimeString()}).catch(function(){})}
+function liveOpen(r){LIVE={id:r.id,name:r.name,ver:r.ver,chars:r.chars};$('#live').hidden=false;$('#lname').textContent=r.name;clearInterval(LTIMER);LTIMER=setInterval(liveTick,5000);liveShow();$('#lst').textContent='Versión '+r.ver+' · '+r.chars+' caracteres';$('#live').scrollIntoView()}
+window.addEventListener('message',function(ev){var d=ev.data||{};if(ev.source!==$('#lframe').contentWindow)return;
+ if(d.t==='ready'){PREADY=true;return}
+ if(d.t==='checked'){if(PWAIT[d.id]){var f=PWAIT[d.id];delete PWAIT[d.id];f(d.errs||[])}return}
+ var m=d.uabErr;if(!m||!LIVE||LERR[m]||Object.keys(LERR).length>=20)return;LERR[m]=1;$('#lrun').appendChild(el('div','⚠ Error al ejecutar: '+m,'err'))});
+$('#lcl').onclick=liveClose;$('#lre').onclick=liveShow;$('#ldl').onclick=function(){if(LIVE&&LIVE.text!=null)dl(LIVE.name,LIVE.text)};
 function fail(e){if(/incorrecta|intentos/.test(e.message)){sessionStorage.removeItem('uab_key');$('#main').hidden=true;$('#login').hidden=false;$('#lerr').textContent=e.message}}
 function enter(){KEY=$('#key').value||KEY;api('tokens').then(function(){sessionStorage.setItem('uab_key',KEY);$('#login').hidden=true;$('#main').hidden=false;refresh()}).catch(function(e){$('#lerr').textContent=e.message})}
 $('#go').onclick=enter;$('#key').addEventListener('keydown',function(e){if(e.key==='Enter')enter()});
@@ -761,8 +816,9 @@ export default {
       if ((segs[1] === 'c' || segs[1] === 'r') && request.method === 'OPTIONS') return new Response(null, {status: 204, headers: {...BASE_HEADERS, ...CORS, 'access-control-max-age': '86400'}});
       if (segs[1] === 'c' && request.method === 'GET') return await handleCall(request, env, ctx, url, segs);
       if (segs[1] === 'r' && request.method === 'GET') return await handleStatus(request, env, url, segs);
+      if (segs[1] === 'admin' && segs[2] === 'preview') return new Response(PREVIEW_HTML, {headers: {...BASE_HEADERS, 'content-type': 'text/html; charset=utf-8', 'content-security-policy': 'sandbox allow-scripts allow-popups allow-modals allow-forms'}});
       if (segs[1] === 'admin' && segs[2] === 'api') return await handleAdminApi(request, env, url, segs);
-      if (segs[1] === 'admin') return new Response(ADMIN_HTML, {headers: {...BASE_HEADERS, 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'"}});
+      if (segs[1] === 'admin') return new Response(ADMIN_HTML, {headers: {...BASE_HEADERS, 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'"}});
       if (url.pathname === '/' || url.pathname === '/health') return text('Universal AI Bridge · Relay v' + VERSION + ' · en línea\nPanel: ' + url.origin + '/admin\n');
       return text('No encontrado.', 404);
     } catch (e) {
