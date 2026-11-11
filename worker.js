@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -131,7 +131,7 @@ async function lockedByOthers(env, fid, ns, tk) {
   return rows.filter(r => ns.includes(r.n))[0] || null;
 }
 const DOCNAME = /^[a-z0-9_-]{1,40}$/;
-const FILE_PART = 4000, FILE_MAX = 800000, WORK_PART = 4000, STALE_MS = 20 * 60000;
+const FILE_PART = 4000, FILE_MAX = 3000000, WORK_PART = 4000, STALE_MS = 20 * 60000;
 function splitParts(s, size = FILE_PART) {
   const parts = []; let i = 0;
   while (i < s.length) {
