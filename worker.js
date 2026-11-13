@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -649,6 +649,60 @@ async function handleCall(request, env, ctx, url, segs) {
     if (Math.random() < 0.02 && ctx?.waitUntil) ctx.waitUntil(cleanup(env));
   }
 }
+/* ---------- conector MCP (para Claude y otras IA que lo soporten, sin iniciar sesión en la app) ---------- */
+const MCP_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+const mcpName = n => n.replace(/\./g, '_');
+function mcpSchema(args) {
+  const props = {};
+  let depth = 0, cur = '';
+  const items = []; for (const ch of String(args || '')) { if (ch === '(') depth++; if (ch === ')') depth--; if (ch === ',' && !depth) { items.push(cur); cur = ''; } else cur += ch; }
+  if (cur.trim()) items.push(cur);
+  for (const it of items) { const m = /^\s*([A-Za-z_]\w*)\s*(\?)?\s*(.*)$/.exec(it); if (m) props[m[1]] = {description: ((m[2] ? '(opcional) ' : '') + m[3]).trim().slice(0, 200) || m[1]}; }
+  return {type: 'object', properties: props, additionalProperties: true};
+}
+async function handleMcp(request, env, ctx, url, segs) {
+  const raw = segs[2] || '', H = {...BASE_HEADERS, 'content-type': 'application/json; charset=utf-8'};
+  const reply = (obj, status = 200) => new Response(JSON.stringify(obj), {status, headers: H});
+  const err = (id, code, message) => ({jsonrpc: '2.0', id: id ?? null, error: {code, message}});
+  if (request.method === 'GET') return new Response('Este conector usa POST (MCP sobre HTTP).', {status: 405, headers: {...BASE_HEADERS, allow: 'POST'}});
+  if (request.method === 'DELETE') return new Response(null, {status: 200, headers: BASE_HEADERS});
+  if (request.method !== 'POST') return new Response(null, {status: 405, headers: BASE_HEADERS});
+  const tok = await getToken(env, raw);
+  if (!tok) return reply(err(null, -32001, 'Enlace no válido, vencido o revocado.'), 401);
+  let body; try { body = await request.json(); } catch { return reply(err(null, -32700, 'JSON no válido.'), 400); }
+  const who = (/^[a-z0-9_-]{1,30}$/i.test(url.searchParams.get('who') || '') ? url.searchParams.get('who').toLowerCase() : 'mcp');
+  const visible = () => Object.entries(TOOLS).filter(([n, t]) => !t.only || t.only === tok.scope);
+  const one = async m => {
+    const id = m.id, p = m.params || {};
+    if (id === undefined || String(m.method || '').startsWith('notifications/')) return null;
+    switch (m.method) {
+      case 'initialize': return {jsonrpc: '2.0', id, result: {protocolVersion: MCP_VERSIONS.includes(p.protocolVersion) ? p.protocolVersion : MCP_VERSIONS[1], capabilities: {tools: {listChanged: false}}, serverInfo: {name: 'Universal AI Bridge', version: VERSION},
+        instructions: 'Herramientas del proyecto del usuario (archivos, notas, tareas…). Llama primero a meta_role para ver tu rol y las reglas del equipo, y a project_check antes de editar. Las acciones delicadas esperan la aprobación del usuario en su panel.' + (tok.scope === 'super' ? ' ' + SUPER_TEXT : '')}};
+      case 'ping': return {jsonrpc: '2.0', id, result: {}};
+      case 'tools/list': return {jsonrpc: '2.0', id, result: {tools: [...visible().map(([n, t]) => ({name: mcpName(n), description: (t.desc + (t.risk !== 'read' ? ' [modifica datos]' : '')).slice(0, 900), inputSchema: mcpSchema(t.args)})),
+        {name: 'approval_status', description: 'Consulta si el usuario ya aprobó o rechazó una acción pendiente (usa el approval_id que te dieron).', inputSchema: {type: 'object', properties: {id: {description: 'approval_id'}}, required: ['id']}}]}};
+      case 'tools/call': {
+        const name = String(p.name || ''), args = p.arguments && typeof p.arguments === 'object' ? p.arguments : {};
+        let res;
+        if (name === 'approval_status') res = await handleStatus(request, env, url, ['', 'r', raw, String(args.id || '')]);
+        else {
+          const real = visible().map(([n]) => n).find(n => mcpName(n) === name);
+          if (!real) return {jsonrpc: '2.0', id, result: {content: [{type: 'text', text: 'Herramienta desconocida: ' + name.slice(0, 40)}], isError: true}};
+          const u = new URL(url.origin + '/c/' + raw + '/' + encodeURIComponent(real));
+          u.searchParams.set('args', JSON.stringify(args)); u.searchParams.set('who', who);
+          res = await handleCall(request, env, ctx, u, ['', 'c', raw, real]);
+        }
+        const txt = (await res.text()).replace(/^UAB\/1 RESULT\n/, '');
+        let ok = true; try { const j = JSON.parse(txt); ok = j.ok !== false; } catch {}
+        return {jsonrpc: '2.0', id, result: {content: [{type: 'text', text: txt.length > 90000 ? txt.slice(0, 90000) + '… (recortado)' : txt}], isError: !ok}};
+      }
+      default: return err(id, -32601, 'Método no soportado: ' + String(m.method).slice(0, 40));
+    }
+  };
+  if (Array.isArray(body)) { const rs = (await Promise.all(body.map(one))).filter(Boolean); return rs.length ? reply(rs) : new Response(null, {status: 202, headers: BASE_HEADERS}); }
+  const r = await one(body);
+  return r ? reply(r) : new Response(null, {status: 202, headers: BASE_HEADERS});
+}
 async function cleanup(env) {
   try {
     await env.DB.batch([
@@ -705,7 +759,7 @@ async function handleAdminApi(request, env, url, segs) {
       await env.DB.prepare('INSERT INTO tokens (token, label, scope, expires, created) VALUES (?,?,?,?,?)').bind(token, label, scope, Date.now() + hours * 36e5, Date.now()).run();
       if (ROLE_TEXT[b.role]) await env.DB.prepare('INSERT OR REPLACE INTO troles (token, role) VALUES (?,?)').bind(token.slice(0, 8), b.role).run();
       await addLog(env, {token: token.slice(0, 8), label, kind: 'admin', status: 'ok', detail: 'Enlace creado (' + scope + ', ' + hours + ' h)'});
-      return json({link_base: url.origin + '/c/' + token + '/', instructions: instructions(url.origin, token) + (scope === 'super' ? '\n\n' + SUPER_TEXT : '')});
+      return json({link_base: url.origin + '/c/' + token + '/', mcp_url: url.origin + '/mcp/' + token + '/', instructions: instructions(url.origin, token) + (scope === 'super' ? '\n\n' + SUPER_TEXT : '')});
     }
     case 'super-order': {
       const text = clip(String(b.text || '').trim(), 1500); if (!text) return json({error: 'Escribe la orden.'}, 400);
@@ -870,10 +924,10 @@ pre{background:#0a0f1d;border:1px solid var(--l);border-radius:10px;padding:10px
 <select id="nr"><option value="">sin rol</option><option value="servidor">rol: servidor</option><option value="interfaz">rol: interfaz</option><option value="javascript">rol: javascript</option></select>
 <select id="nh"><option value="1">1 hora</option><option value="24" selected>24 horas</option><option value="168">7 días</option><option value="720">30 días</option></select>
 <select id="ns"><option value="write">Lectura y escritura</option><option value="read">Solo lectura</option></select><button class="pri" id="mk">Crear</button></div>
-<div id="made" hidden><p>Copia este texto y pégalo en el chat de la IA:</p><pre id="ins"></pre><div class="row"><button id="cp">Copiar instrucciones</button></div></div><div class="err" id="merr"></div></div>
+<div id="made" hidden><p><b>Para Claude (sin iniciar sesión en la app):</b> en claude.ai → Personalizar → Conectores → Agregar conector personalizado, y pega esta dirección:</p><pre id="mcpu"></pre><p>O copia este texto y pégalo en el chat de la IA:</p><pre id="ins"></pre><div class="row"><button id="cp">Copiar instrucciones</button></div></div><div class="err" id="merr"></div></div>
 <div class="panel"><h2>Supervisor (IA maestra)</h2><p>Una IA que revisa y arregla el trabajo de las demás mientras tú no estás. <b>Solo trabaja mientras tenga tu permiso</b>: el permiso se acaba solo. No puede borrar funciones, bloques grandes ni archivos, y todo lo que haga lo puedes deshacer en «Cambios».</p>
 <div class="row"><select id="sh"><option value="1">1 hora</option><option value="2" selected>2 horas</option><option value="4">4 horas</option><option value="8">8 horas</option><option value="12">12 horas</option></select><button class="pri" id="sg">Dar permiso</button><button id="sx">Quitar permiso ya</button></div>
-<div id="sst"></div><div id="smade" hidden><p>Este es el enlace del supervisor. En la app, abre la pestaña de tu IA maestra (Claude), toca el botón UAB, pega este enlace en la casilla de arriba y pulsa «Insertar instrucciones»:</p><pre id="slink"></pre><div class="row"><button id="scp">Copiar enlace</button></div></div>
+<div id="sst"></div><div id="smade" hidden><p>Este es el enlace del supervisor. En la app, abre la pestaña de tu IA maestra (Claude), toca el botón UAB, pega este enlace en la casilla de arriba y pulsa «Insertar instrucciones»:</p><pre id="slink"></pre><p>Para usarlo como conector de Claude (claude.ai → Personalizar → Conectores → Agregar conector personalizado), pega esta dirección:</p><pre id="smcp"></pre><div class="row"><button id="scp">Copiar enlace</button></div></div>
 <h2 style="margin-top:12px">Dar una orden al supervisor</h2><p>Escribe qué quieres (ej.: «arregla el juego y hazme un menú nuevo»). El supervisor la ve en su próximo ciclo, la reparte por roles y te informa.</p>
 <textarea id="so" rows="3" style="width:100%" placeholder="Tu orden…"></textarea><div class="row"><button class="pri" id="sob">Enviar orden</button><span id="soe"></span></div><div id="sord"></div>
 <h2 style="margin-top:12px">Qué hizo cada IA (24 h)</h2><div id="sia"></div>
@@ -1006,7 +1060,7 @@ function supervisor(){api('super-state').then(function(d){var b=$('#sst');b.repl
  (d.por_ia||[]).forEach(function(r){var k=r.label.split('/')[0];ia.appendChild(el('div',r.label+' · '+r.llamadas+' acciones ('+r.fallos+' con error) · '+(ed[k]||0)+' ediciones · última hace '+ago(r.ultima)))});
  var rp=$('#srep');rp.replaceChildren();if(!d.informes.length)rp.appendChild(el('div','Todavía no ha dejado informes.'));
  d.informes.forEach(function(r){var x=el('div',null,'item');x.appendChild(el('b','Hace '+ago(r.t)+' · '));x.appendChild(el('span',r.text));rp.appendChild(x)})}).catch(fail)}
-$('#sg').onclick=function(){api('new-token',{label:'supervisor',hours:+$('#sh').value,scope:'super'}).then(function(d){$('#smade').hidden=false;$('#slink').textContent=d.link_base;refresh()}).catch(function(e){alert(e.message)})};
+$('#sg').onclick=function(){api('new-token',{label:'supervisor',hours:+$('#sh').value,scope:'super'}).then(function(d){$('#smade').hidden=false;$('#slink').textContent=d.link_base;$('#smcp').textContent=d.mcp_url;refresh()}).catch(function(e){alert(e.message)})};
 $('#sob').onclick=function(){var t=$('#so').value.trim();if(!t)return;api('super-order',{text:t}).then(function(){$('#so').value='';$('#soe').textContent='Enviada ✓';setTimeout(function(){$('#soe').textContent=''},3000);supervisor()}).catch(function(e){$('#soe').textContent=e.message})};
 $('#sx').onclick=function(){if(!confirm('¿Quitar el permiso al supervisor ahora?'))return;api('super-state').then(function(d){return Promise.all(d.activos.map(function(a){return api('revoke',{tk:a.tk})}))}).then(function(){$('#smade').hidden=true;refresh()})};
 $('#scp').onclick=function(){var t=$('#slink').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t)};
@@ -1046,7 +1100,7 @@ $('#tn').onclick=function(){$('#terr').textContent='';var role=$('#tr').value,ex
  api('task-new',{file:$('#tf').value,role:role,instr:ins}).then(function(){$('#ti').value='';refresh()}).catch(function(e){$('#terr').textContent=e.message})};
 $('#wcp').onclick=function(){navigator.clipboard.writeText(WTXT).then(function(){$('#wcp').textContent='Copiado'}).catch(function(){$('#wcp').textContent='Selecciona y copia a mano'})};
 $('#wdl').onclick=function(){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([WTXT],{type:'text/plain'}));a.download=(WDOC||'documento')+'.txt';document.body.appendChild(a);a.click();a.remove()};
-$('#mk').onclick=function(){$('#merr').textContent='';api('new-token',{label:$('#nl').value,hours:+$('#nh').value,scope:$('#ns').value,role:$('#nr').value}).then(function(d){$('#ins').textContent=d.instructions;$('#made').hidden=false;refresh()}).catch(function(e){$('#merr').textContent=e.message})};
+$('#mk').onclick=function(){$('#merr').textContent='';api('new-token',{label:$('#nl').value,hours:+$('#nh').value,scope:$('#ns').value,role:$('#nr').value}).then(function(d){$('#ins').textContent=d.instructions;$('#mcpu').textContent=d.mcp_url;$('#made').hidden=false;refresh()}).catch(function(e){$('#merr').textContent=e.message})};
 $('#cp').onclick=function(){navigator.clipboard.writeText($('#ins').textContent).then(function(){$('#cp').textContent='Copiado'}).catch(function(){$('#cp').textContent='Selecciona y copia a mano'})};
 setInterval(function(){if(!$('#main').hidden&&!document.hidden)refresh()},6000);
 if(KEY){enter()}
@@ -1060,6 +1114,7 @@ export default {
       if (!env.DB) return text('Falta el binding D1 llamado DB.', 500);
       await ensureSchema(env);
       if ((segs[1] === 'c' || segs[1] === 'r') && request.method === 'OPTIONS') return new Response(null, {status: 204, headers: {...BASE_HEADERS, ...CORS, 'access-control-max-age': '86400'}});
+      if (segs[1] === 'mcp') return await handleMcp(request, env, ctx, url, segs);
       if (segs[1] === 'c' && request.method === 'GET') return await handleCall(request, env, ctx, url, segs);
       if (segs[1] === 'r' && request.method === 'GET') return await handleStatus(request, env, url, segs);
       if (segs[1] === 'admin' && segs[2] === 'preview') return new Response(PREVIEW_HTML, {headers: {...BASE_HEADERS, 'content-type': 'text/html; charset=utf-8', 'content-security-policy': 'sandbox allow-scripts allow-popups allow-modals allow-forms'}});
