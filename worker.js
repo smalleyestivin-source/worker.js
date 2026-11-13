@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -32,6 +32,8 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS fver (file TEXT PRIMARY KEY, ver INTEGER DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS fhist (id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT, ver INTEGER, who TEXT, t INTEGER, note TEXT, ch TEXT, undone INTEGER DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS flocks (file TEXT, n INTEGER, tk TEXT, label TEXT, exp INTEGER, PRIMARY KEY (file, n))',
+  'CREATE TABLE IF NOT EXISTS troles (token TEXT PRIMARY KEY, role TEXT)',
+  'CREATE TABLE IF NOT EXISTS sorders (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER, text TEXT, done INTEGER DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS sreports (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER, who TEXT, text TEXT)',
   'CREATE INDEX IF NOT EXISTS ix_fhist_file ON fhist(file, id)',
   'CREATE INDEX IF NOT EXISTS ix_logs_token_t ON logs(token, t)',
@@ -156,11 +158,79 @@ function gameHtml(genero, tema) {
     'this.player=this.physics.add.sprite(100,450,"jugador").setBounce(0.2).setCollideWorldBounds(true);this.physics.add.collider(this.player,p);this.cursors=this.input.keyboard.createCursorKeys()},\n' +
     'update:function(){var c=this.cursors,j=this.player;if(c.left.isDown)j.setVelocityX(-160);else if(c.right.isDown)j.setVelocityX(160);else j.setVelocityX(0);if(c.up.isDown&&j.body.touching.down)j.setVelocityY(-530)}}});\n</script></body></html>';
 }
-const SUPER_TEXT = 'ERES EL SUPERVISOR de este proyecto. El usuario te dio permiso por un tiempo limitado (termina cuando venza tu enlace); sin permiso no puedes hacer nada. ' +
-  'Mientras él no está: 1) Llama super.watch (espera hasta 15 s) y repite con since = el valor «ahora» que te devuelva. 2) Cuando haya ediciones o tareas terminadas, revisa: files.check del archivo y files.read de las partes cambiadas (files.history dice cuáles). ' +
-  '3) Si hay un error claro (sintaxis, interfaz, bug evidente) arréglalo con files.patch: cambios pequeños y una «note» corta. Si es grande o dudas, crea una tarea con tasks.create diciendo archivo, línea y qué arreglar. ' +
-  '4) NO puedes borrar funciones, bloques grandes ni archivos: si algo debe eliminarse, déjalo escrito en super.report para que decida el usuario. ' +
-  '5) Cada cierto tiempo escribe super.report (máx. 600 caracteres): qué revisaste, qué arreglaste, qué falta. 6) Sigue en bucle mientras tengas permiso. No inventes resultados ni digas que revisaste algo que no leíste.';
+const ROLE_TEXT = {
+  servidor: 'SERVIDOR (backend, base de datos, API y lógica que corre en el servidor)',
+  interfaz: 'INTERFAZ (HTML, CSS, menús, diseño y comodidad en celular y tablet)',
+  javascript: 'JAVASCRIPT (lógica del navegador, eventos, juego y conexión con la interfaz)'
+};
+const TEAM_RULES = ' Reglas del equipo: antes de empezar llama project.check (monitor del proyecto) y tasks.list; toma solo tareas de tu rol (tasks.claim). ' +
+  'Si cambias un id, clase o nombre de función, busca con files.search dónde más se usa y actualízalo también. Después de editar, llama files.check del archivo y project.check; si sale un error tuyo, arréglalo antes de tasks.done. ' +
+  'Usa files.outline y files.lines para trabajar en archivos grandes sin leerlos enteros. Si un archivo tiene líneas gigantes (todo en una sola línea), avisa al supervisor en vez de reescribirlo.';
+const lineOf = (text, i) => text.slice(0, i).split('\n').length;
+const JS_BUILTIN = new Set(('if for while switch catch return function typeof new await async super require import alert prompt confirm parseInt parseFloat isNaN isFinite setTimeout setInterval clearTimeout clearInterval requestAnimationFrame cancelAnimationFrame fetch atob btoa encodeURIComponent decodeURIComponent encodeURI decodeURI eval structuredClone queueMicrotask addEventListener removeEventListener getComputedStyle matchMedia console describe it expect test String Number Boolean Array Object Math JSON Date Promise Symbol Map Set WeakMap Error RegExp BigInt Int8Array Uint8Array Float32Array Float64Array Image Audio Blob File FormData URL XMLHttpRequest WebSocket Worker Event CustomEvent MutationObserver IntersectionObserver ResizeObserver DOMParser TextEncoder TextDecoder AudioContext Proxy Reflect Intl').split(' '));
+// Monitor entre archivos: referencias HTML/CSS/JS que no llevan a ninguna parte.
+function crossCheck(files) {
+  const probs = [], add = (archivo, linea, tipo, mensaje) => { if (probs.length < 40) probs.push({archivo, linea, tipo, mensaje}); };
+  const html = files.filter(f => /\.html?$/i.test(f.name)), css = files.filter(f => /\.css$/i.test(f.name)), js = files.filter(f => /\.m?js$/i.test(f.name));
+  const all = files.map(f => f.text).join('\n'), names = new Set(files.map(f => f.name.toLowerCase())), bases = new Set(files.map(f => f.name.toLowerCase().split('/').pop()));
+  const jsText = [...js, ...html].map(f => f.text).join('\n');
+  // ids definidos (en HTML o creados desde JS)
+  const hasId = id => new RegExp('\\bid\\s*[=:]\\s*["\'`]' + id.replace(/[^\w-]/g, '') + '["\'`]').test(all) || new RegExp('\\.id\\s*=\\s*["\'`]' + id.replace(/[^\w-]/g, '')).test(all) || new RegExp('setAttribute\\(\\s*["\']id["\']\\s*,\\s*["\']' + id.replace(/[^\w-]/g, '')).test(all) || new RegExp('<[a-z0-9]+[^>]*\\bid=\\\\?["\']' + id.replace(/[^\w-]/g, '')).test(all);
+  const hasClass = c => new RegExp('(^|[^\\w-])' + c.replace(/[^\w-]/g, '') + '([^\\w-]|$)').test(html.map(f => f.text).join('\n') + '\n' + jsText);
+  // funciones definidas
+  const defined = new Set(JS_BUILTIN);
+  for (const m of jsText.matchAll(/\bfunction\s*\*?\s*([\w$]+)|\b(?:const|let|var)\s+([\w$]+)\s*=|\bclass\s+([\w$]+)|\b([\w$]+)\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)|(?:window|globalThis)\.([\w$]+)\s*=|\bimport\s+(?:\*\s+as\s+)?([\w$]+)|\{([^}]*)\}\s*=|function[^(]*\(([^)]*)\)|\(([^)]*)\)\s*=>|\b([\w$]+)\s*=>/g)) {
+    for (const g of m.slice(1)) if (g) for (const w of g.split(/[\s,{}=:]+/)) if (w) defined.add(w);
+  }
+  for (const f of html) {
+    const t = f.text;
+    for (const m of t.matchAll(/\b(?:src|href)\s*=\s*["']([^"'#?]+)/gi)) {
+      const u = m[1].trim(); if (!u || /^(https?:|data:|mailto:|tel:|javascript:|\/\/|blob:)/i.test(u)) continue;
+      const clean = u.replace(/^\.?\//, '').toLowerCase();
+      if (!names.has(clean) && !bases.has(clean.split('/').pop()) && /\.(js|css|png|jpg|jpeg|gif|svg|webp|json|mp3|wav|ogg|html?)$/i.test(clean)) add(f.name, lineOf(t, m.index), 'enlace roto', 'Apunta a «' + u + '» pero ese archivo no está en el proyecto.');
+    }
+    for (const m of t.matchAll(/\bon[a-z]+\s*=\s*["']\s*([A-Za-z_$][\w$]*)\s*\(/g)) if (!defined.has(m[1])) add(f.name, lineOf(t, m.index), 'función inexistente', 'El HTML llama a «' + m[1] + '()» pero esa función no está definida en ningún archivo.');
+  }
+  for (const f of [...js, ...html]) {
+    const t = f.text;
+    for (const m of t.matchAll(/getElementById\(\s*["']([\w-]+)["']\s*\)/g)) if (!hasId(m[1])) add(f.name, lineOf(t, m.index), 'id inexistente', 'Busca el id «' + m[1] + '» pero no existe en el HTML.');
+    for (const m of t.matchAll(/querySelector(?:All)?\(\s*["']([#.])([\w-]+)["']\s*\)/g)) {
+      if (m[1] === '#' ? !hasId(m[2]) : !hasClass(m[2])) add(f.name, lineOf(t, m.index), m[1] === '#' ? 'id inexistente' : 'clase inexistente', 'Busca «' + m[1] + m[2] + '» pero no aparece en el HTML.');
+    }
+  }
+  for (const f of js) {
+    const t = f.text.replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' ')).replace(/(^|[^:])\/\/[^\n]*/g, (m, a) => a);
+    const seen = new Set();
+    for (const m of t.matchAll(/(^|[^\w$.])([a-z_$][\w$]*)\s*\(/g)) {
+      const n = m[2]; if (defined.has(n) || seen.has(n) || n.length < 3) continue; seen.add(n);
+      add(f.name, lineOf(t, m.index + m[1].length), 'posible función inexistente', 'Llama a «' + n + '()» y no la encuentro definida. Si viene de una librería externa (CDN), ignóralo.');
+    }
+  }
+  for (const f of css) {
+    const unused = new Set(); for (const m of f.text.matchAll(/(^|[\s,>+~}])\.([A-Za-z_][\w-]*)/g)) if (!hasClass(m[2])) unused.add(m[2]);
+    if (unused.size) add(f.name, 1, 'css sin usar', 'Clases del CSS que no aparecen en el HTML ni en el JS: ' + [...unused].slice(0, 12).join(', ') + (unused.size > 12 ? '…' : ''));
+  }
+  return probs;
+}
+function outline(name, text) {
+  const out = [], push = (i, tipo, nombre) => { if (out.length < 250) out.push({linea: lineOf(text, i), tipo, nombre}); };
+  for (const m of text.matchAll(/\bfunction\s*\*?\s*([\w$]+)\s*\(/g)) push(m.index, 'función', m[1]);
+  for (const m of text.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[\w$]+\s*=>)/g)) push(m.index, 'función', m[1]);
+  for (const m of text.matchAll(/\bclass\s+([\w$]+)/g)) push(m.index, 'clase', m[1]);
+  for (const m of text.matchAll(/^\s*def\s+(\w+)/gm)) push(m.index, 'función', m[1]);
+  if (/\.html?$/i.test(name)) {
+    for (const m of text.matchAll(/<(script|style)\b[^>]*>/gi)) push(m.index, 'bloque', m[1].toLowerCase());
+    for (const m of text.matchAll(/\bid\s*=\s*["']([\w-]+)["']/g)) push(m.index, 'id', m[1]);
+  }
+  if (/\.css$/i.test(name)) for (const m of text.matchAll(/^([^\n{}@][^{}\n]{0,60})\s*\{/gm)) push(m.index, 'selector', m[1].trim());
+  return out.sort((a, b) => a.linea - b.linea);
+}
+const SUPER_TEXT = 'ERES EL SUPERVISOR (modo maestro) de este proyecto. El usuario es el líder: tú guías al equipo y él te da órdenes. Tienes permiso por tiempo limitado (termina cuando venza tu enlace); sin permiso no puedes hacer nada. ' +
+  'CICLO: 1) Llama super.watch (espera hasta 15 s) y repite con since = el valor «ahora». Si trae «ordenes», esa es tu misión: léela completa. ' +
+  '2) Con una orden nueva: revisa el proyecto (project.check, files.list, files.outline), haz un plan corto y reparte el trabajo con tasks.create, una tarea por cosa y con role = servidor, interfaz o javascript según corresponda (cada IA solo toma tareas de su rol). Si no hay orden, no inventes trabajo grande: solo vigila, revisa lo que se entregó y arregla errores pequeños. ' +
+  '3) Cuando una IA entregue (tareas_terminadas o ediciones_nuevas): revisa con files.check, project.check y files.lines/files.read. Si hay un error, dilo con precisión: crea una tarea con tasks.create que diga archivo, línea y qué arreglar. Los errores claros y pequeños (sintaxis, interfaz) puedes arreglarlos tú con files.patch (cambios pequeños y una «note»). ' +
+  '4) NO puedes borrar funciones, bloques grandes ni archivos: si algo debe eliminarse, déjalo en super.report para que decida el usuario. ' +
+  '5) Cada ciclo importante escribe super.report (máx. 600 caracteres): qué ordenó el usuario, qué repartiste, qué revisaste, qué falta; incluye order = el id de la orden cuando la termines. Cuando el usuario vuelva te preguntará qué pasó: responde con eso. 6) Sigue en bucle mientras tengas permiso. No inventes resultados ni digas que revisaste algo que no leíste.';
 const SUPER_NO = ['notes.delete', 'webhook.send', 'web.fetch'];
 const FN_RE = /\bfunction\s*\*?\s*[\w$]+|\b(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[\w$]+\s*=>)|\bdef\s+\w+|\bclass\s+\w+/g;
 function countFns(s) { return (s.match(FN_RE) || []).length; }
@@ -300,7 +370,8 @@ const TOOLS = {
     await c.env.DB.prepare("INSERT INTO tasks (id, file, role, instr, status, created) VALUES (?,?,?,?,'open',?)").bind(id, f ? f.id : '', clip(String(a.role || 'arreglar'), 30), instr, Date.now()).run();
     return {tarea: id, mensaje: 'Tarea creada. Las IA del equipo la verán en tasks.list.'};
   }},
-  'super.report': {risk: 'write', only: 'super', desc: 'SUPERVISOR: deja un informe corto para el usuario (qué revisaste, qué arreglaste, qué falta). Máx. 600 caracteres.', args: 'text', run: async (a, c) => {
+  'super.report': {risk: 'write', only: 'super', desc: 'SUPERVISOR: deja un informe corto para el usuario (qué revisaste, qué arreglaste, qué falta). Máx. 600 caracteres.', args: 'text, order? (id de la orden que terminaste)', run: async (a, c) => {
+    if (a.order) await c.env.DB.prepare('UPDATE sorders SET done = 1 WHERE id = ?').bind(Math.floor(num(a.order, 0, 0, 1e9))).run();
     await c.env.DB.prepare('INSERT INTO sreports (t, who, text) VALUES (?,?,?)').bind(Date.now(), clip(c.label || 'supervisor', 40), clip(need(a.text, 'text'), 600)).run();
     await c.env.DB.prepare('DELETE FROM sreports WHERE id <= (SELECT MAX(id) FROM sreports) - 200').run();
     return {guardado: true};
@@ -310,15 +381,40 @@ const TOOLS = {
     for (;;) {
       const ed = (await c.env.DB.prepare("SELECT f.name AS archivo, h.ver, h.who, h.t, h.note FROM fhist h JOIN files f ON f.id = h.file WHERE h.t > ? AND h.who NOT LIKE 'supervisor%' ORDER BY h.id DESC LIMIT 10").bind(since).all()).results;
       const tk = (await c.env.DB.prepare('SELECT id, role, owner, summary FROM tasks WHERE done_t > ? LIMIT 10').bind(since).all()).results;
-      if (ed.length || tk.length || Date.now() >= end) {
+      if (ed.length || tk.length || Date.now() >= end || (await c.env.DB.prepare('SELECT 1 FROM sorders WHERE done = 0 LIMIT 1').first())) {
         const pend = (await c.env.DB.prepare("SELECT COUNT(*) c FROM approvals WHERE status = 'pending'").first()).c;
         const open = (await c.env.DB.prepare("SELECT COUNT(*) c FROM tasks WHERE status != 'done'").first()).c;
-        return {ahora: Date.now(), ediciones_nuevas: ed, tareas_terminadas: tk, aprobaciones_esperando_al_usuario: pend, tareas_pendientes: open, mensaje: ed.length || tk.length ? 'Hay cambios: revisa con files.check y files.read.' : 'Sin novedades. Vuelve a llamar con since = ahora.'};
+        const ord = (await c.env.DB.prepare('SELECT id, text, t FROM sorders WHERE done = 0 ORDER BY id LIMIT 3').all()).results;
+        return {ahora: Date.now(), ordenes: ord, ediciones_nuevas: ed, tareas_terminadas: tk, aprobaciones_esperando_al_usuario: pend, tareas_pendientes: open, mensaje: ord.length ? 'HAY ÓRDENES del usuario: es tu misión. Cuando la termines, super.report con order = su id.' : ed.length || tk.length ? 'Hay cambios: revisa con files.check, project.check y files.read.' : 'Sin novedades. Vuelve a llamar con since = ahora.'};
       }
       await new Promise(r => setTimeout(r, 2500));
     }
   }},
-  'meta.role': {risk: 'read', desc: 'Devuelve tu rol y reglas especiales (si tu enlace tiene un rol).', args: '', run: async (a, c) => ({texto: c.scope === 'super' ? SUPER_TEXT : ''})},
+  'meta.role': {risk: 'read', desc: 'Devuelve tu rol y reglas especiales (si tu enlace tiene un rol).', args: '', run: async (a, c) => {
+    if (c.scope === 'super') return {texto: SUPER_TEXT, supervisor: true};
+    const r = await c.env.DB.prepare('SELECT role FROM troles WHERE token = ?').bind(c.rawTk).first();
+    return {texto: (r && ROLE_TEXT[r.role] ? 'TU ROL: ' + ROLE_TEXT[r.role] + '.' : '') + TEAM_RULES, rol: r ? r.role : 'general', supervisor: false};
+  }},
+  'files.lines': {risk: 'read', desc: 'Lee solo unas líneas de un archivo (con su número). Ideal para ir a la línea que dice un error.', args: 'file, from, to? (máx. 120 líneas)', run: async (a, c) => {
+    const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join(''), L = text.split('\n');
+    const from = Math.floor(num(a.from, 1, 1, L.length)), to = Math.min(L.length, Math.floor(num(a.to, from + 39, from, from + 119)));
+    return {file: f.id, nombre: f.name, total_lineas: L.length, desde: from, hasta: to, texto: L.slice(from - 1, to).map((x, i) => (from + i) + '| ' + (x.length > 400 ? x.slice(0, 400) + ' …(línea larga: ' + x.length + ' caracteres)' : x)).join('\n')};
+  }},
+  'files.outline': {risk: 'read', desc: 'Mapa de un archivo: funciones, clases, ids y bloques con su número de línea. Úsalo antes de leer un archivo grande.', args: 'file', run: async (a, c) => {
+    const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join('');
+    return {file: f.id, nombre: f.name, lineas: text.split('\n').length, caracteres: text.length, elementos: outline(f.name, text)};
+  }},
+  'project.check': {risk: 'read', desc: 'MONITOR del proyecto: revisa todos los archivos juntos y avisa de enlaces rotos, ids/clases/funciones que se usan y no existen, y CSS sin usar.', args: '', run: async (a, c) => {
+    const rows = (await c.env.DB.prepare('SELECT id, name, chars FROM files ORDER BY name LIMIT 300').all()).results, files = [];
+    let total = 0;
+    for (const r of rows) {
+      if (!/\.(html?|css|m?js)$/i.test(r.name) || total > 2500000) continue;
+      files.push({name: r.name, text: (await loadParts(c.env, r.id)).map(p => p.text).join('')}); total += r.chars;
+    }
+    const probs = crossCheck(files), rev = files.map(f => ({archivo: f.name, lineas: f.text.split('\n').length, caracteres: f.text.length, linea_mas_larga: Math.max(...f.text.split('\n').map(l => l.length))}));
+    const gigantes = rev.filter(r => r.linea_mas_larga > 2000).map(r => r.archivo);
+    return {archivos_revisados: files.length, problemas: probs, ok: probs.length === 0, archivos: rev.slice(0, 40), aviso_lineas_gigantes: gigantes.length ? 'Estos archivos tienen líneas enormes (código en una sola línea), lo que dificulta editar y localizar errores: ' + gigantes.join(', ') : undefined, nota: 'Son avisos automáticos por lectura del texto: confirma cada uno antes de cambiar algo.'};
+  }},
   'files.list': {risk: 'read', desc: 'Lista los archivos del proyecto (nombre con su ruta, tamaño y versión). Usa prefix para ver solo una carpeta, por ejemplo prefix=src/.', args: 'prefix?, limit? (1-100, por defecto 50)', run: async (a, c) => {
     const pre = String(a.prefix ?? '').trim().toLowerCase().replace(/[%_]/g, ''), lim = Math.floor(num(a.limit, 50, 1, 100));
     const total = (await c.env.DB.prepare("SELECT COUNT(*) c FROM files WHERE lower(name) LIKE ?").bind(pre + '%').first()).c;
@@ -400,6 +496,11 @@ const TOOLS = {
     const r = await c.env.DB.prepare("UPDATE tasks SET status = 'claimed', owner = ?, owner_tk = ?, claimed = ? WHERE id = ? AND (status = 'open' OR (status = 'claimed' AND claimed < ?) OR (status = 'claimed' AND owner_tk = ?))").bind(clip(c.label || 'ia', 40), c.tk, now, id, now - STALE_MS, c.tk).run();
     const t = await c.env.DB.prepare('SELECT id, role, file, instr, status, owner FROM tasks WHERE id = ?').bind(id).first();
     if (!t) throw new Error('No existe esa tarea. Usa tasks.list.');
+    const mine = await c.env.DB.prepare('SELECT role FROM troles WHERE token = ?').bind(c.rawTk).first();
+    if (r.meta.changes && mine && ROLE_TEXT[mine.role] && ROLE_TEXT[t.role] && mine.role !== t.role) {
+      await c.env.DB.prepare("UPDATE tasks SET status = 'open', owner = NULL, owner_tk = NULL, claimed = NULL WHERE id = ?").bind(id).run();
+      throw new Error('Esa tarea es de «' + t.role + '» y tu rol es «' + mine.role + '». Elige una de tu rol con tasks.list.');
+    }
     if (!r.meta.changes) throw new Error('Otra IA ya tomó esta tarea (' + t.owner + '). Elige otra con tasks.list.');
     const f = t.file ? await c.env.DB.prepare('SELECT id, name, chars, parts FROM files WHERE id = ?').bind(t.file).first() : null;
     return {task: t.id, role: t.role, instruction: t.instr, file: f, write_to_doc: 'r-' + t.id, max_chars_per_part: 300, how: 'Lee el archivo con files.read (part=1,2,3…). Escribe tu resultado con work.append usando doc="r-' + t.id + '" y n=1,2,3… Al terminar usa tasks.done.'};
@@ -602,15 +703,24 @@ async function handleAdminApi(request, env, url, segs) {
     case 'new-token': {
       const token = rand(16), label = clip(b.label || 'ia', 30), hours = num(b.hours, 24, 1, 720), scope = b.scope === 'read' ? 'read' : b.scope === 'super' ? 'super' : 'write';
       await env.DB.prepare('INSERT INTO tokens (token, label, scope, expires, created) VALUES (?,?,?,?,?)').bind(token, label, scope, Date.now() + hours * 36e5, Date.now()).run();
+      if (ROLE_TEXT[b.role]) await env.DB.prepare('INSERT OR REPLACE INTO troles (token, role) VALUES (?,?)').bind(token.slice(0, 8), b.role).run();
       await addLog(env, {token: token.slice(0, 8), label, kind: 'admin', status: 'ok', detail: 'Enlace creado (' + scope + ', ' + hours + ' h)'});
       return json({link_base: url.origin + '/c/' + token + '/', instructions: instructions(url.origin, token) + (scope === 'super' ? '\n\n' + SUPER_TEXT : '')});
+    }
+    case 'super-order': {
+      const text = clip(String(b.text || '').trim(), 1500); if (!text) return json({error: 'Escribe la orden.'}, 400);
+      await env.DB.prepare('INSERT INTO sorders (t, text) VALUES (?,?)').bind(Date.now(), text).run();
+      return json({ok: true});
     }
     case 'super-state': {
       const now = Date.now();
       const act = (await env.DB.prepare("SELECT substr(token, 1, 8) AS tk, label, expires FROM tokens WHERE scope = 'super' AND revoked = 0 AND expires > ? ORDER BY created DESC LIMIT 5").bind(now).all()).results;
       const rep = (await env.DB.prepare('SELECT t, who, text FROM sreports ORDER BY id DESC LIMIT 15').all()).results;
       const st = (await env.DB.prepare("SELECT tool, status, COUNT(*) c FROM logs WHERE kind = 'call' AND label LIKE 'supervisor%' AND t > ? GROUP BY tool, status").bind(now - 86400000).all()).results;
-      return json({activos: act, informes: rep, actividad: st});
+      const ord = (await env.DB.prepare('SELECT id, t, text, done FROM sorders ORDER BY id DESC LIMIT 5').all()).results;
+      const porIa = (await env.DB.prepare("SELECT label, COUNT(*) llamadas, SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) ok, SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) fallos, MAX(t) ultima FROM logs WHERE kind = 'call' AND t > ? GROUP BY label ORDER BY llamadas DESC LIMIT 12").bind(now - 86400000).all()).results;
+      const ed = (await env.DB.prepare('SELECT who, COUNT(*) ediciones FROM fhist WHERE t > ? GROUP BY who').bind(now - 86400000).all()).results;
+      return json({activos: act, informes: rep, actividad: st, ordenes: ord, por_ia: porIa, ediciones: ed});
     }
     case 'tokens': return json((await env.DB.prepare('SELECT substr(token, 1, 8) AS tk, label, scope, expires, created, revoked FROM tokens ORDER BY created DESC LIMIT 30').all()).results);
     case 'revoke': { await env.DB.prepare('UPDATE tokens SET revoked = 1 WHERE substr(token, 1, 8) = ?').bind(String(b.tk || '')).run(); return json({ok: true}); }
@@ -756,13 +866,17 @@ pre{background:#0a0f1d;border:1px solid var(--l);border-radius:10px;padding:10px
 <div id="main" hidden>
 <div class="panel"><h2>Aprobaciones</h2><p>Las IA piden permiso aquí para acciones sensibles.</p><div id="aps"></div></div>
 <div class="panel"><h2>Crear enlace para una IA</h2><p>Cada IA recibe su propio enlace temporal. Puedes revocarlo cuando quieras.</p>
-<div class="row"><select id="nl"><option>chatgpt</option><option>grok</option><option>deepseek</option><option>gemini</option><option>perplexity</option><option>otra</option></select>
+<div class="row"><select id="nl"><option>claude</option><option>chatgpt</option><option>grok</option><option>kimi</option><option>stitch</option><option>deepseek</option><option>gemini</option><option>perplexity</option><option>otra</option></select>
+<select id="nr"><option value="">sin rol</option><option value="servidor">rol: servidor</option><option value="interfaz">rol: interfaz</option><option value="javascript">rol: javascript</option></select>
 <select id="nh"><option value="1">1 hora</option><option value="24" selected>24 horas</option><option value="168">7 días</option><option value="720">30 días</option></select>
 <select id="ns"><option value="write">Lectura y escritura</option><option value="read">Solo lectura</option></select><button class="pri" id="mk">Crear</button></div>
 <div id="made" hidden><p>Copia este texto y pégalo en el chat de la IA:</p><pre id="ins"></pre><div class="row"><button id="cp">Copiar instrucciones</button></div></div><div class="err" id="merr"></div></div>
 <div class="panel"><h2>Supervisor (IA maestra)</h2><p>Una IA que revisa y arregla el trabajo de las demás mientras tú no estás. <b>Solo trabaja mientras tenga tu permiso</b>: el permiso se acaba solo. No puede borrar funciones, bloques grandes ni archivos, y todo lo que haga lo puedes deshacer en «Cambios».</p>
 <div class="row"><select id="sh"><option value="1">1 hora</option><option value="2" selected>2 horas</option><option value="4">4 horas</option><option value="8">8 horas</option><option value="12">12 horas</option></select><button class="pri" id="sg">Dar permiso</button><button id="sx">Quitar permiso ya</button></div>
 <div id="sst"></div><div id="smade" hidden><p>Este es el enlace del supervisor. En la app, abre la pestaña de tu IA maestra (Claude), toca el botón UAB, pega este enlace en la casilla de arriba y pulsa «Insertar instrucciones»:</p><pre id="slink"></pre><div class="row"><button id="scp">Copiar enlace</button></div></div>
+<h2 style="margin-top:12px">Dar una orden al supervisor</h2><p>Escribe qué quieres (ej.: «arregla el juego y hazme un menú nuevo»). El supervisor la ve en su próximo ciclo, la reparte por roles y te informa.</p>
+<textarea id="so" rows="3" style="width:100%" placeholder="Tu orden…"></textarea><div class="row"><button class="pri" id="sob">Enviar orden</button><span id="soe"></span></div><div id="sord"></div>
+<h2 style="margin-top:12px">Qué hizo cada IA (24 h)</h2><div id="sia"></div>
 <h2 style="margin-top:12px">Informe del supervisor</h2><div id="sstat"></div><div id="srep"></div></div>
 <div class="panel"><h2>Equipo de IA</h2><p>Sube un archivo de texto o código, crea tareas y deja que varias IA trabajen en él. Los resultados aparecen en la mesa de trabajo.</p>
 <div class="row"><input type="file" id="ff" multiple><button class="pri" id="fu">Subir</button></div><p><small>Puedes elegir varios archivos o un <b>.zip</b> con todo tu proyecto: se sube cada archivo de texto por separado, con su ruta. Si subes uno con el mismo nombre, lo reemplaza.</small></p><div class="err" id="ferr"></div><input id="fq" placeholder="Buscar archivo…" style="width:100%;margin:6px 0"><div id="fls"></div>
@@ -815,7 +929,7 @@ function team(){
   var v=el('button','Ver');v.onclick=function(){api('work-get',{doc:r.doc}).then(function(x){WTXT=x.text;WDOC=r.doc;$('#wview').textContent=(x.missing.length?'[Faltan las partes: '+x.missing.join(', ')+']\\n\\n':'')+x.text;$('#wview').hidden=false;$('#wact').hidden=false})};
   var b=el('button','Borrar','no');b.onclick=function(){if(confirm('¿Borrar este documento?'))api('work-delete',{doc:r.doc}).then(function(){$('#wview').hidden=true;$('#wact').hidden=true;refresh()})};
   var w=el('div',null,'row');w.append(v,b);d.appendChild(w)})}).catch(fail)}
-function dl(name,text){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
+function dl(name,text){if(window.UABNative&&UABNative.saveFile){try{UABNative.saveFile(name,text);return}catch(e){}}var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
 function proj(){
  supervisor();
  api('ai-status').then(function(rows){fill($('#ais'),rows,function(d,r){
@@ -874,6 +988,7 @@ function liveTick(){if(!LIVE||document.hidden)return;
   if(r.ver!==LIVE.ver){LIVE.ver=r.ver;LIVE.chars=r.chars;liveShow()}
   $('#lst').textContent='Versión '+r.ver+' · '+r.chars+' caracteres · se actualiza solo cada 5 s · revisado '+new Date().toLocaleTimeString()}).catch(function(){})}
 function liveOpen(r){LIVE={id:r.id,name:r.name,ver:r.ver,chars:r.chars};$('#live').hidden=false;$('#lname').textContent=r.name;clearInterval(LTIMER);LTIMER=setInterval(liveTick,5000);liveShow();$('#lst').textContent='Versión '+r.ver+' · '+r.chars+' caracteres';$('#live').scrollIntoView()}
+document.addEventListener('visibilitychange',function(){if(!document.hidden)liveTick()});window.addEventListener('online',liveTick);
 window.addEventListener('message',function(ev){var d=ev.data||{};if(ev.source!==$('#lframe').contentWindow)return;
  if(d.t==='ready'){PREADY=true;return}
  if(d.t==='checked'){if(PWAIT[d.id]){var f=PWAIT[d.id];delete PWAIT[d.id];f(d.errs||[])}return}
@@ -885,9 +1000,14 @@ function supervisor(){api('super-state').then(function(d){var b=$('#sst');b.repl
  var st=$('#sstat');st.replaceChildren();var n={};d.actividad.forEach(function(r){n[r.tool+'|'+r.status]=(n[r.tool+'|'+r.status]||0)+r.c});
  function g(t,s){return n[t+'|'+(s||'ok')]||0}
  st.appendChild(el('div','Últimas 24 h: '+g('files.check')+' revisiones · '+g('files.patch')+' arreglos hechos · '+g('tasks.create')+' tareas creadas · '+(g('files.patch','error')+g('files.patch','blocked'))+' intentos rechazados'));
+ var od=$('#sord');od.replaceChildren();(d.ordenes||[]).forEach(function(o){od.appendChild(el('div',(o.done?'✓ Hecha: ':'… Pendiente: ')+o.text,o.done?'good':'tag'))});
+ var ia=$('#sia');ia.replaceChildren();var ed={};(d.ediciones||[]).forEach(function(e){ed[e.who.split('/')[0]]=(ed[e.who.split('/')[0]]||0)+e.ediciones});
+ if(!(d.por_ia||[]).length)ia.appendChild(el('div','Sin actividad en las últimas 24 horas.'));
+ (d.por_ia||[]).forEach(function(r){var k=r.label.split('/')[0];ia.appendChild(el('div',r.label+' · '+r.llamadas+' acciones ('+r.fallos+' con error) · '+(ed[k]||0)+' ediciones · última hace '+ago(r.ultima)))});
  var rp=$('#srep');rp.replaceChildren();if(!d.informes.length)rp.appendChild(el('div','Todavía no ha dejado informes.'));
  d.informes.forEach(function(r){var x=el('div',null,'item');x.appendChild(el('b','Hace '+ago(r.t)+' · '));x.appendChild(el('span',r.text));rp.appendChild(x)})}).catch(fail)}
 $('#sg').onclick=function(){api('new-token',{label:'supervisor',hours:+$('#sh').value,scope:'super'}).then(function(d){$('#smade').hidden=false;$('#slink').textContent=d.link_base;refresh()}).catch(function(e){alert(e.message)})};
+$('#sob').onclick=function(){var t=$('#so').value.trim();if(!t)return;api('super-order',{text:t}).then(function(){$('#so').value='';$('#soe').textContent='Enviada ✓';setTimeout(function(){$('#soe').textContent=''},3000);supervisor()}).catch(function(e){$('#soe').textContent=e.message})};
 $('#sx').onclick=function(){if(!confirm('¿Quitar el permiso al supervisor ahora?'))return;api('super-state').then(function(d){return Promise.all(d.activos.map(function(a){return api('revoke',{tk:a.tk})}))}).then(function(){$('#smade').hidden=true;refresh()})};
 $('#scp').onclick=function(){var t=$('#slink').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t)};
 function fail(e){if(/incorrecta|intentos/.test(e.message)){sessionStorage.removeItem('uab_key');$('#main').hidden=true;$('#login').hidden=false;$('#lerr').textContent=e.message}}
@@ -926,7 +1046,7 @@ $('#tn').onclick=function(){$('#terr').textContent='';var role=$('#tr').value,ex
  api('task-new',{file:$('#tf').value,role:role,instr:ins}).then(function(){$('#ti').value='';refresh()}).catch(function(e){$('#terr').textContent=e.message})};
 $('#wcp').onclick=function(){navigator.clipboard.writeText(WTXT).then(function(){$('#wcp').textContent='Copiado'}).catch(function(){$('#wcp').textContent='Selecciona y copia a mano'})};
 $('#wdl').onclick=function(){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([WTXT],{type:'text/plain'}));a.download=(WDOC||'documento')+'.txt';document.body.appendChild(a);a.click();a.remove()};
-$('#mk').onclick=function(){$('#merr').textContent='';api('new-token',{label:$('#nl').value,hours:+$('#nh').value,scope:$('#ns').value}).then(function(d){$('#ins').textContent=d.instructions;$('#made').hidden=false;refresh()}).catch(function(e){$('#merr').textContent=e.message})};
+$('#mk').onclick=function(){$('#merr').textContent='';api('new-token',{label:$('#nl').value,hours:+$('#nh').value,scope:$('#ns').value,role:$('#nr').value}).then(function(d){$('#ins').textContent=d.instructions;$('#made').hidden=false;refresh()}).catch(function(e){$('#merr').textContent=e.message})};
 $('#cp').onclick=function(){navigator.clipboard.writeText($('#ins').textContent).then(function(){$('#cp').textContent='Copiado'}).catch(function(){$('#cp').textContent='Selecciona y copia a mano'})};
 setInterval(function(){if(!$('#main').hidden&&!document.hidden)refresh()},6000);
 if(KEY){enter()}
