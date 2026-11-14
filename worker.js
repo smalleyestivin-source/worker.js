@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -40,6 +40,8 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS connectors (id TEXT PRIMARY KEY, name TEXT, kind TEXT, url TEXT, auth_env TEXT, auth_mode TEXT, notes TEXT, created INTEGER, last_t INTEGER, last_ok INTEGER, last_ms INTEGER, last_info TEXT)',
   'CREATE TABLE IF NOT EXISTS notifs (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER, who TEXT, level TEXT, title TEXT, text TEXT, nag INTEGER DEFAULT 0, seen INTEGER DEFAULT 0, last_nag INTEGER DEFAULT 0, nags INTEGER DEFAULT 0, dest TEXT DEFAULT \'usuario\')',
   'CREATE TABLE IF NOT EXISTS aistate (label TEXT PRIMARY KEY, status TEXT, note TEXT, until INTEGER, t INTEGER)',
+  'CREATE TABLE IF NOT EXISTS pview (tok TEXT PRIMARY KEY, entry TEXT, exp INTEGER)',
+  'CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)',
   'CREATE INDEX IF NOT EXISTS ix_fsnap_file ON fsnap(file, t)',
   'CREATE INDEX IF NOT EXISTS ix_notifs_seen ON notifs(dest, seen, id)',
   'CREATE INDEX IF NOT EXISTS ix_fhist_file ON fhist(file, id)',
@@ -1065,7 +1067,7 @@ async function handleCall(request, env, ctx, url, segs) {
   if (def.risk !== 'read' && tok.scope === 'read') return fail('Este enlace es de solo lectura.', 'blocked', call.tool);
   if (def.only && def.only !== tok.scope) return fail('Esta herramienta es solo para el supervisor.', 'blocked', call.tool);
   if (tok.scope === 'super' && SUPER_NO.includes(call.tool)) return fail('El supervisor no puede usar «' + call.tool + '»: no puede borrar ni enviar datos fuera.', 'blocked', call.tool);
-  if (needsApproval(call.tool, call.args, env)) {
+  if (needsApproval(call.tool, call.args, env) && !(await autoGranted(env, call.tool))) {
     const argsJson = JSON.stringify(call.args);
     const dedupe = await sha256([tk, who, call.tool, argsJson, Math.floor(Date.now() / 600000)].join('|'));
     await env.DB.prepare('INSERT OR IGNORE INTO approvals (id, tk, label, tool, args, dedupe, status, created) VALUES (?,?,?,?,?,?,?,?)').bind(rand(6), tk, lbl, call.tool, argsJson, dedupe, 'pending', Date.now()).run();
@@ -1154,6 +1156,32 @@ async function handleStatus(request, env, url, segs) {
   const row = await env.DB.prepare('SELECT id, tool, status, result FROM approvals WHERE id = ? AND tk = ?').bind(segs[3] || '', raw.slice(0, 8)).first();
   if (!row) return out({ok: false, error: 'No existe esa aprobación.'});
   return out(approvalView(row, url.origin, raw));
+}
+
+
+/* ----- permiso temporal: el usuario deja que ciertas acciones se aprueben solas por un rato ----- */
+const GRANTABLE = ['web.fetch', 'webhook.send', 'notes.delete', 'connectors.add', 'connectors.call', 'connectors.remove'];
+async function grantGet(env) {
+  const r = await env.DB.prepare("SELECT v FROM settings WHERE k = 'grant'").first();
+  let g = {until: 0, tools: []}; try { if (r) g = JSON.parse(r.v); } catch {}
+  g.tools = (g.tools || []).filter(t => GRANTABLE.includes(t));
+  return {until: Number(g.until) || 0, tools: g.tools, active: (Number(g.until) || 0) > Date.now() && g.tools.length > 0};
+}
+async function autoGranted(env, tool) { try { const g = await grantGet(env); return g.active && g.tools.includes(tool); } catch { return false; } }
+
+/* ----- vista previa para abrir en el navegador del usuario ----- */
+const MIME = {html: 'text/html', htm: 'text/html', js: 'text/javascript', mjs: 'text/javascript', css: 'text/css', json: 'application/json', svg: 'image/svg+xml', txt: 'text/plain', md: 'text/plain', xml: 'application/xml'};
+async function handleView(request, env, url, segs) {
+  const tok = segs[2] || '';
+  if (!/^[0-9a-f]{24}$/.test(tok)) return text('Enlace no válido.', 404);
+  const pv = await env.DB.prepare('SELECT entry, exp FROM pview WHERE tok = ?').bind(tok).first();
+  if (!pv || pv.exp < Date.now()) return text('Esta vista previa venció. Ábrela de nuevo desde el panel.', 410);
+  let name; try { name = decodeURIComponent(segs.slice(3).join('/')) || pv.entry; } catch { return text('Ruta no válida.', 400); }
+  name = name.replace(/^\.?\//, '');
+  const f = await env.DB.prepare("SELECT id, name FROM files WHERE lower(name) = lower(?) OR lower(name) LIKE '%/' || lower(?) ORDER BY created DESC LIMIT 1").bind(name, name).first();
+  if (!f) return text('No existe «' + clip(name, 80) + '» en el proyecto.', 404);
+  const body = (await loadParts(env, f.id)).map(p => p.text).join(''), ext = f.name.toLowerCase().split('.').pop(), isHtml = ext === 'html' || ext === 'htm';
+  return new Response(body, {headers: {...BASE_HEADERS, 'content-type': (MIME[ext] || 'text/plain') + '; charset=utf-8', 'access-control-allow-origin': '*', ...(isHtml ? {'content-security-policy': 'sandbox allow-scripts allow-popups allow-modals allow-forms allow-downloads'} : {})}});
 }
 
 /* ---------- administración ---------- */
@@ -1322,6 +1350,22 @@ async function handleAdminApi(request, env, url, segs) {
     case 'snap-list': try { const f = await getFileRow(env, b.id); return json((await env.DB.prepare('SELECT id, label, who, t, ver, chars FROM fsnap WHERE file = ? ORDER BY t DESC, rowid DESC LIMIT 10').bind(f.id).all()).results); } catch (e) { return json({error: String(e.message || e)}, 400); }
     case 'snap-create': try { const f = await getFileRow(env, b.id); return json({ok: true, ...(await snapCreate(env, f, 'usuario', b.label || 'desde el panel', false))}); } catch (e) { return json({error: String(e.message || e)}, 400); }
     case 'snap-restore': try { const f = await getFileRow(env, b.id); return json({ok: true, ...(await snapRestore(env, f, b.snap, 'usuario', ''))}); } catch (e) { return json({error: String(e.message || e)}, 400); }
+    case 'grant-get': return json(await grantGet(env));
+    case 'grant-set': {
+      const tools = (Array.isArray(b.tools) ? b.tools : []).filter(t => GRANTABLE.includes(t)), hours = num(b.hours, 2, 1, 24);
+      if (!tools.length) return json({error: 'Elige al menos una acción para permitir.'}, 400);
+      await env.DB.prepare("INSERT INTO settings (k, v) VALUES ('grant', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(JSON.stringify({until: Date.now() + hours * 36e5, tools})).run();
+      await addLog(env, {kind: 'admin', status: 'ok', detail: 'Permiso temporal: ' + tools.join(', ') + ' por ' + hours + ' h'});
+      return json({ok: true, ...(await grantGet(env))});
+    }
+    case 'grant-off': { await env.DB.prepare("DELETE FROM settings WHERE k = 'grant'").run(); return json({ok: true}); }
+    case 'preview-link': {
+      try {
+        const f = await getFileRow(env, b.id), tok = rand(12);
+        await env.DB.batch([env.DB.prepare('DELETE FROM pview WHERE exp < ?').bind(Date.now()), env.DB.prepare('INSERT INTO pview (tok, entry, exp) VALUES (?,?,?)').bind(tok, f.name, Date.now() + 3600000)]);
+        return json({ok: true, url: url.origin + '/v/' + tok + '/' + f.name.split('/').map(encodeURIComponent).join('/'), minutos: 60});
+      } catch (e) { return json({error: String(e.message || e)}, 400); }
+    }
     default: return json({error: 'Acción desconocida.'}, 404);
   }
 }
@@ -1337,47 +1381,73 @@ parent.postMessage({t:'ready'},'*');
 </scr`+`ipt></body></html>`;
 const ADMIN_HTML = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Universal AI Bridge · Panel</title>
 <style>
-:root{--bg:#0b1020;--p:#131a2e;--l:#ffffff1f;--t:#eef3ff;--m:#93a2bf;--b:#6d8cff;--g:#56d6a0;--a:#f2c16b;--r:#ff7b8a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.5 system-ui,sans-serif;padding:16px;max-width:900px;margin:0 auto}
-h1{font-size:20px;margin:6px 0 2px}h2{font-size:15px;margin:0 0 8px}p{color:var(--m);margin:0 0 12px;font-size:12px}
-.good{color:var(--g);font-size:12px}.panel{background:var(--p);border:1px solid var(--l);border-radius:14px;padding:14px;margin:12px 0}
-input,select,button{font:inherit;color:inherit;background:#0e1527;border:1px solid var(--l);border-radius:10px;padding:9px 11px}
-button{cursor:pointer;background:#1b2542}button.pri{background:linear-gradient(110deg,#6685ff,#8069ef);border:0;color:#fff}button.ok{border-color:#56d6a066;color:var(--g)}button.no{border-color:#ff7b8a66;color:var(--r)}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}.item{border-top:1px solid var(--l);padding:10px 0;font-size:12px;overflow-wrap:anywhere}.item:first-child{border-top:0}
-pre{background:#0a0f1d;border:1px solid var(--l);border-radius:10px;padding:10px;white-space:pre-wrap;word-break:break-word;font-size:11px;max-height:260px;overflow:auto}
-.tag{font-size:10px;padding:2px 7px;border-radius:6px;border:1px solid var(--l);color:var(--m)}.err{color:var(--r);font-size:12px;min-height:16px}small{color:var(--m)}
+:root{--bg:#0a0e1a;--bg2:#0e1426;--p:#141c33;--p2:#1b2644;--l:#ffffff1a;--t:#eef2ff;--m:#9aa8c8;--b:#7a93ff;--b2:#9a7bff;--g:#4fd8a0;--a:#f4c46b;--r:#ff8393;--rad:16px}
+@media (prefers-color-scheme:light){:root{--bg:#f1f4fb;--bg2:#e9eef9;--p:#ffffff;--p2:#eef2fb;--l:#12204a1c;--t:#141b34;--m:#58658a;--b:#4a63e8;--b2:#7a55e6;--g:#0c8f63;--a:#a86d06;--r:#d03550}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+[hidden],.hid{display:none!important}
+body{margin:0;background:radial-gradient(1100px 520px at 8% -8%,#2a3a7a44,transparent 60%),var(--bg);color:var(--t);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:max(10px,env(safe-area-inset-top)) 14px calc(92px + env(safe-area-inset-bottom));max-width:980px;margin:0 auto;min-height:100vh}
+header.top{display:flex;align-items:center;gap:12px;padding:14px 2px 4px}
+.logo{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--b),var(--b2));display:grid;place-items:center;font-size:23px;box-shadow:0 8px 26px #6a7dff44;flex:none}
+h1{font-size:19px;margin:0;line-height:1.2}header p{margin:2px 0 0;font-size:12px}
+h2{font-size:16px;margin:0 0 6px}p{color:var(--m);margin:0 0 12px;font-size:13px}
+.good{color:var(--g);font-size:13px}.err{color:var(--r);font-size:13px;min-height:16px}small{color:var(--m)}
+.panel{background:var(--p);border:1px solid var(--l);border-radius:var(--rad);padding:16px;margin:12px 0;box-shadow:0 10px 30px #00000020}
+input,select,textarea,button{font:inherit;color:inherit;background:var(--p2);border:1px solid var(--l);border-radius:12px;padding:10px 13px;min-height:44px;max-width:100%}
+input[type=checkbox]{min-height:0;width:20px;height:20px;padding:0;accent-color:var(--b)}
+textarea{width:100%;resize:vertical}
+button{cursor:pointer;font-weight:600;transition:transform .08s,filter .15s}button:active{transform:scale(.97)}button:disabled{opacity:.5}
+button.pri{background:linear-gradient(110deg,var(--b),var(--b2));border:0;color:#fff}
+button.ok{border-color:#4fd8a066;color:var(--g)}button.no{border-color:#ff839366;color:var(--r)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.item{border-top:1px solid var(--l);padding:12px 0;font-size:13px;overflow-wrap:anywhere}.item:first-child{border-top:0}
+pre{background:var(--bg2);border:1px solid var(--l);border-radius:12px;padding:12px;white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:260px;overflow:auto}
+.tag{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--l);color:var(--m);margin-left:4px;white-space:nowrap}
+.nag{position:sticky;top:6px;z-index:30;background:linear-gradient(110deg,#ff6b81,#ff9f5a);color:#fff;font-weight:700;border-radius:14px;padding:13px 15px;margin:10px 0;cursor:pointer;box-shadow:0 10px 30px #ff6b8144}
+nav#tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;gap:4px;padding:8px 10px calc(8px + env(safe-area-inset-bottom));background:var(--p);border-top:1px solid var(--l)}
+nav#tabs button{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;background:none;border:0;border-radius:12px;font-size:11px;color:var(--m);padding:6px 2px;min-height:54px;position:relative}
+nav#tabs button .i{font-size:21px;line-height:1}
+nav#tabs button.on{color:var(--t);background:var(--p2)}
+nav#tabs .bd{position:absolute;top:2px;left:calc(50% + 6px);background:var(--r);color:#fff;border-radius:999px;font-size:10px;min-width:17px;height:17px;display:grid;place-items:center;padding:0 4px}
+@media(min-width:760px){body{padding-bottom:30px}nav#tabs{position:sticky;top:0;bottom:auto;border:1px solid var(--l);border-radius:16px;margin:10px 0}nav#tabs button{flex-direction:row;justify-content:center;gap:8px;font-size:13px;min-height:46px}.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.cols>.panel{margin:0}}
+@media(max-width:420px){.row>button,.row>select{flex:1 1 140px}}
 </style></head><body>
-<h1>Universal AI Bridge · Panel</h1><p>Relay v${VERSION}. Aquí apruebas acciones, creas enlaces para tus IA y ves la actividad.</p>
+<header class="top"><div class="logo">🌉</div><div><h1>Universal AI Bridge</h1><p>Relay v${VERSION} · tu centro de control</p></div></header>
 <div class="panel" id="login"><h2>Entrar</h2><div class="row"><input id="key" type="password" placeholder="Tu ADMIN_KEY" autocomplete="off"><button class="pri" id="go">Entrar</button></div><div class="err" id="lerr"></div></div>
 <div id="main" hidden>
-<div class="panel"><h2>Aprobaciones</h2><p>Las IA piden permiso aquí para acciones sensibles.</p><div id="aps"></div></div>
-<div class="panel"><h2>Crear enlace para una IA</h2><p>Cada IA recibe su propio enlace temporal. Puedes revocarlo cuando quieras.</p>
+<div id="nagbar" class="nag" hidden></div>
+<nav id="tabs"><button data-t="inicio" class="on"><span class="i">🏠</span>Inicio<b class="bd" id="bd-inicio" hidden></b></button><button data-t="equipo"><span class="i">👥</span>Equipo</button><button data-t="proyecto"><span class="i">📁</span>Proyecto</button><button data-t="conectores"><span class="i">🔌</span>Conectores</button><button data-t="actividad"><span class="i">📊</span>Actividad</button></nav>
+<div class="panel" data-t="inicio"><h2>🔔 Avisos</h2><p id="nst"></p><div id="nts"></div><div class="row"><button id="nall">Marcar todo como visto</button><button id="ntest">Enviar aviso de prueba</button></div><p><small>Para recibirlos en el teléfono aunque la app esté cerrada: instala la app gratuita <b>ntfy</b>, suscríbete a un tema secreto (inventa uno largo) y en Cloudflare crea la variable <b>NTFY_TOPIC</b> con ese mismo nombre de tema.</small></p></div>
+<div class="panel" data-t="inicio"><h2>✋ Aprobaciones</h2><p>Las IA piden permiso aquí para acciones sensibles.</p><div id="aps"></div></div>
+<div class="panel" data-t="equipo"><h2>🔗 Crear enlace para una IA</h2><p>Cada IA recibe su propio enlace temporal. Puedes revocarlo cuando quieras.</p>
 <div class="row"><select id="nl"><option>claude</option><option>chatgpt</option><option>grok</option><option>kimi</option><option>stitch</option><option>deepseek</option><option>gemini</option><option>perplexity</option><option>otra</option></select>
 <select id="nr"><option value="">sin rol</option><option value="servidor">rol: servidor</option><option value="interfaz">rol: interfaz</option><option value="javascript">rol: javascript</option></select>
 <select id="nh"><option value="1">1 hora</option><option value="24" selected>24 horas</option><option value="168">7 días</option><option value="720">30 días</option></select>
 <select id="ns"><option value="write">Lectura y escritura</option><option value="read">Solo lectura</option></select><button class="pri" id="mk">Crear</button></div>
 <div id="made" hidden><p><b>Para Claude (sin iniciar sesión en la app):</b> en claude.ai → Personalizar → Conectores → Agregar conector personalizado, y pega esta dirección:</p><pre id="mcpu"></pre><p>O copia este texto y pégalo en el chat de la IA:</p><pre id="ins"></pre><div class="row"><button id="cp">Copiar instrucciones</button></div></div><div class="err" id="merr"></div></div>
-<div class="panel"><h2>Supervisor (IA maestra)</h2><p>Una IA que revisa y arregla el trabajo de las demás mientras tú no estás. <b>Solo trabaja mientras tenga tu permiso</b>: el permiso se acaba solo. No puede borrar funciones, bloques grandes ni archivos, y todo lo que haga lo puedes deshacer en «Cambios».</p>
+<div class="panel" data-t="equipo"><h2>🧠 Supervisor (IA maestra)</h2><p>Una IA que revisa y arregla el trabajo de las demás mientras tú no estás. <b>Solo trabaja mientras tenga tu permiso</b>: el permiso se acaba solo. No puede borrar funciones, bloques grandes ni archivos, y todo lo que haga lo puedes deshacer en «Cambios».</p>
 <div class="row"><select id="sh"><option value="1">1 hora</option><option value="2" selected>2 horas</option><option value="4">4 horas</option><option value="8">8 horas</option><option value="12">12 horas</option></select><button class="pri" id="sg">Dar permiso</button><button id="sx">Quitar permiso ya</button></div>
 <div id="sst"></div><div id="smade" hidden><p>Este es el enlace del supervisor. En la app, abre la pestaña de tu IA maestra (Claude), toca el botón UAB, pega este enlace en la casilla de arriba y pulsa «Insertar instrucciones»:</p><pre id="slink"></pre><p>Para usarlo como conector de Claude (claude.ai → Personalizar → Conectores → Agregar conector personalizado), pega esta dirección:</p><pre id="smcp"></pre><div class="row"><button id="scp">Copiar enlace</button></div></div>
 <h2 style="margin-top:12px">Dar una orden al supervisor</h2><p>Escribe qué quieres (ej.: «arregla el juego y hazme un menú nuevo»). El supervisor la ve en su próximo ciclo, la reparte por roles y te informa.</p>
 <textarea id="so" rows="3" style="width:100%" placeholder="Tu orden…"></textarea><div class="row"><button class="pri" id="sob">Enviar orden</button><span id="soe"></span></div><div id="sord"></div>
 <h2 style="margin-top:12px">Qué hizo cada IA (24 h)</h2><div id="sia"></div>
 <h2 style="margin-top:12px">Informe del supervisor</h2><div id="sstat"></div><div id="srep"></div></div>
-<div class="panel"><h2>Equipo de IA</h2><p>Sube un archivo de texto o código, crea tareas y deja que varias IA trabajen en él. Los resultados aparecen en la mesa de trabajo.</p>
+<div class="panel" data-t="equipo"><h2>👥 Equipo de IA</h2><p>Sube un archivo de texto o código, crea tareas y deja que varias IA trabajen en él. Los resultados aparecen en la mesa de trabajo.</p>
 <div class="row"><input type="file" id="ff" multiple><button class="pri" id="fu">Subir</button></div><p><small>Puedes elegir varios archivos o un <b>.zip</b> con todo tu proyecto: se sube cada archivo de texto por separado, con su ruta. Si subes uno con el mismo nombre, lo reemplaza.</small></p><div class="err" id="ferr"></div><input id="fq" placeholder="Buscar archivo…" style="width:100%;margin:6px 0"><div id="fls"></div>
 <h2 style="margin-top:14px">Nueva tarea</h2>
 <div class="row"><select id="tf"></select><select id="tr"><option value="resumir">Resumir</option><option value="errores">Buscar errores</option><option value="revisar">Revisar</option><option value="arreglar">Arreglar</option><option value="otro">Otra</option></select></div>
 <div class="row"><input id="ti" placeholder="Instrucción extra (opcional)" style="flex:1;min-width:200px"><button class="pri" id="tn">Crear tarea</button></div><div class="err" id="terr"></div><div id="tls"></div>
 <h2 style="margin-top:14px">Mesa de trabajo</h2><div id="wls"></div><pre id="wview" hidden></pre><div class="row" id="wact" hidden><button id="wcp">Copiar</button><button id="wdl">Descargar</button></div></div>
-<div class="panel"><h2>Proyecto en vivo</h2><p>Qué hace cada IA ahora y los cambios que han hecho al archivo. Puedes deshacer cualquier cambio.</p>
+<div class="panel" data-t="inicio"><h2>⏱️ Permiso temporal</h2><p>Cuando no estés, deja que algunas acciones se aprueben solas por un rato. Se apaga solo. Lo que no marques sigue pidiendo tu botón, y las preguntas super.approve siempre te las hacen a ti.</p><div id="gst"></div><div id="gtl"></div><div class="row"><select id="gh"><option value="1">1 hora</option><option value="2" selected>2 horas</option><option value="4">4 horas</option><option value="8">8 horas</option><option value="24">24 horas</option></select><button class="pri" id="gon">Activar permiso</button><button id="goff">Quitar ya</button></div><div class="err" id="gerr"></div></div>
+<div class="panel" data-t="conectores"><h2>🔌 Conectores</h2><p>Servidores y APIs a los que tus IA pueden llamar (con tu permiso). Las claves nunca se guardan aquí: se crean como secretos en Cloudflare con un nombre que empiece por CONN_.</p><div id="cls"></div></div>
+<div class="panel" data-t="conectores"><h2>➕ Añadir conector</h2><div class="row"><select id="cpre" style="flex:1"></select></div><div class="row"><input id="cn" placeholder="nombre (ej. render)" style="flex:1;min-width:140px"><select id="ck"></select></div><div class="row"><input id="cu" placeholder="https://tu-servidor.onrender.com" style="flex:1;min-width:220px"></div><div class="row"><input id="ce" placeholder="Secreto CONN_… (opcional)" style="flex:1;min-width:180px"><select id="cm"><option value="bearer">Authorization: Bearer</option><option value="none">Sin autenticación</option><option value="header:x-api-key">Header x-api-key</option><option value="query:key">Parámetro ?key=</option></select></div><div class="row"><input id="cnote" placeholder="Notas (opcional)" style="flex:1;min-width:160px"><button class="pri" id="cadd">Guardar</button></div><div class="err" id="cerr"></div><p><small>Para usar una clave: en Cloudflare → Workers → worker-js → Settings → Variables and Secrets, crea un secreto con el nombre que pongas arriba (empieza con CONN_). Los conectores de pagos solo los usa tu app: las IA no pueden llamarlos.</small></p></div>
+<div class="panel" data-t="proyecto"><h2>📁 Proyecto en vivo</h2><p>Qué hace cada IA ahora y los cambios que han hecho al archivo. Puedes deshacer cualquier cambio.</p>
 <h2>IAs conectadas</h2><div id="ais"></div>
 <h2 style="margin-top:14px">Archivos del proyecto</h2><div id="pjs"></div><div id="live" hidden><h2 style="margin-top:14px">En vivo: <span id="lname"></span></h2><p id="lst"></p>
-<div class="row"><button id="lre">Actualizar ya</button><button id="ldl">Descargar</button><button id="lcl">Cerrar</button></div>
+<div class="row"><button class="pri" id="lext">🌐 Abrir en mi navegador</button><button id="lre">Actualizar ya</button><button id="ldl">Descargar</button><button id="lcl">Cerrar</button></div>
 <div id="lchk"></div><div id="lrun"></div><iframe id="lframe" src="/admin/preview" sandbox="allow-scripts allow-popups" style="width:100%;height:340px;border:1px solid var(--l);border-radius:10px;background:#fff;margin-top:8px;display:none"></iframe>
 <pre id="lcode" hidden style="max-height:340px;overflow:auto"></pre><h2 style="margin-top:10px">Últimos cambios</h2><div id="lhist"></div></div><div id="hist"></div></div>
-<div class="panel"><h2>Enlaces activos</h2><div id="tks"></div></div>
-<div class="panel"><h2>Actividad</h2><div class="row"><button id="rf">Actualizar</button></div><div id="lgs"></div></div>
+<div class="panel" data-t="actividad"><h2>🔑 Enlaces activos</h2><div id="tks"></div></div>
+<div class="panel" data-t="actividad"><h2>📊 Actividad</h2><div class="row"><button id="rf">Actualizar</button></div><div id="lgs"></div></div>
 </div>
 <script>
 var KEY=sessionStorage.getItem('uab_key')||'';
@@ -1387,7 +1457,7 @@ function api(a,b){return fetch('/admin/api/'+a,{method:'POST',headers:{'content-
 function ago(t){var s=Math.max(0,(Date.now()-t)/1000);return s<60?'ahora':s<3600?Math.floor(s/60)+' min':s<86400?Math.floor(s/3600)+' h':Math.floor(s/86400)+' d'}
 function fill(box,rows,draw){box.replaceChildren();if(!rows.length){box.appendChild(el('p','Nada por ahora.'));return}rows.forEach(function(r){var d=el('div',null,'item');draw(d,r);box.appendChild(d)})}
 function refresh(){
- team();proj();
+ team();proj();avisos();conn();grant();
  api('approvals').then(function(rows){fill($('#aps'),rows.filter(function(r){return r.status==='pending'}).concat(rows.filter(function(r){return r.status!=='pending'}).slice(0,5)),function(d,r){
   d.appendChild(el('b',r.tool+' · '+r.label+' · '+ago(r.created)));d.appendChild(el('span',' '+r.status,'tag'));d.appendChild(el('pre',r.args));
   if(r.status==='pending'){var w=el('div',null,'row');var a=el('button','Aprobar','ok'),n=el('button','Rechazar','no');
@@ -1419,16 +1489,16 @@ function dl(name,text){if(window.UABNative&&UABNative.saveFile){try{UABNative.sa
 function proj(){
  supervisor();
  api('ai-status').then(function(rows){fill($('#ais'),rows,function(d,r){
-  var act=r.last_t&&Date.now()-r.last_t<120000,st=r.pending>0?'espera tu aprobación':act?'trabajando':r.last_t?'sin actividad':'sin usar';
+  var act=r.last_t&&Date.now()-r.last_t<120000,st=r.estado==='sin_limites'?'sin límites':r.estado==='posible_parada'?'posible parada':r.pending>0?'espera tu aprobación':act?'trabajando':r.last_t?'sin actividad':'sin usar';
   d.appendChild(el('b',r.label+' · '+r.tk+'… '));d.appendChild(el('span',st,'tag'));
-  d.appendChild(el('div',(r.last_t?'Última acción: '+r.last_tool+' ('+r.last_status+') hace '+ago(r.last_t)+' · ':'')+r.calls10+' llamadas en 10 min'+(r.task?' · tarea: '+r.task:'')))})}).catch(fail);
+  d.appendChild(el('div',(r.last_t?'Última acción: '+r.last_tool+' ('+r.last_status+') hace '+ago(r.last_t)+' · ':'')+r.calls10+' llamadas en 10 min'+(r.task?' · tarea: '+r.task:'')));if(r.nota)d.appendChild(el('div','⚠ '+r.nota,'err'))})}).catch(fail);
  api('file-list').then(function(rows){fill($('#pjs'),rows,function(d,r){
   d.appendChild(el('b',r.name));d.appendChild(el('span',' versión '+r.ver+' · '+r.chars+' caracteres','tag'));
   var w=el('div',null,'row'),b1=el('button','Descargar'),b2=el('button','Cambios'),b3=el('button','Reordenar partes'),b4=el('button','Ver en vivo','pri');b4.onclick=function(){liveOpen(r)};
   b1.onclick=function(){api('file-get',{id:r.id}).then(function(x){dl(x.name,x.text)}).catch(function(e){alert(e.message)})};
   b2.onclick=function(){hist(r)};
   b3.onclick=function(){if(confirm('Reordena las partes del archivo. Borra el historial de cambios de este archivo. ¿Seguir?'))api('file-rebalance',{id:r.id}).then(refresh).catch(function(e){alert(e.message)})};
-  w.append(b4,b1,b2,b3);d.appendChild(w)})}).catch(fail)}
+  var b5=el('button','🌐 Abrir en navegador'),b6=el('button','Copias de seguridad');b5.onclick=function(){openExt(r.id)};b6.onclick=function(){snaps(r)};w.append(b4,b5,b1,b2,b6,b3);d.appendChild(w)})}).catch(fail)}
 function hist(f){api('file-hist',{id:f.id}).then(function(rows){var box=$('#hist');box.replaceChildren();box.appendChild(el('h2','Cambios en '+f.name));
  if(!rows.length)box.appendChild(el('p','Todavía nadie ha editado este archivo.'));
  rows.forEach(function(r){var d=el('div',null,'item');d.appendChild(el('b','v'+r.ver+' · '+r.who+' · hace '+ago(r.t)));
@@ -1535,6 +1605,51 @@ $('#wdl').onclick=function(){var a=document.createElement('a');a.href=URL.create
 $('#mk').onclick=function(){$('#merr').textContent='';api('new-token',{label:$('#nl').value,hours:+$('#nh').value,scope:$('#ns').value,role:$('#nr').value}).then(function(d){$('#ins').textContent=d.instructions;$('#mcpu').textContent=d.mcp_url;$('#made').hidden=false;refresh()}).catch(function(e){$('#merr').textContent=e.message})};
 $('#cp').onclick=function(){navigator.clipboard.writeText($('#ins').textContent).then(function(){$('#cp').textContent='Copiado'}).catch(function(){$('#cp').textContent='Selecciona y copia a mano'})};
 setInterval(function(){if(!$('#main').hidden&&!document.hidden)refresh()},6000);
+
+/* ---------- v0.11: pestañas, avisos, permiso temporal, conectores, copias, vista en navegador ---------- */
+function showTab(t){try{sessionStorage.setItem('uab_tab',t)}catch(e){}document.querySelectorAll('[data-t]').forEach(function(e){if(e.tagName==='BUTTON')e.classList.toggle('on',e.dataset.t===t);else e.classList.toggle('hid',e.dataset.t!==t)});window.scrollTo(0,0)}
+document.querySelectorAll('nav#tabs button').forEach(function(b){b.onclick=function(){showTab(b.dataset.t)}});
+var PEND=0,UNSEEN=0,NAGT=null,AC=null;
+function badge(){var n=PEND+UNSEEN,b=$('#bd-inicio');b.hidden=!n;b.textContent=n>9?'9+':n}
+function beep(){try{AC=AC||new (window.AudioContext||window.webkitAudioContext)();var o=AC.createOscillator(),g=AC.createGain();o.connect(g);g.connect(AC.destination);o.frequency.value=880;g.gain.value=.15;o.start();o.stop(AC.currentTime+.25)}catch(e){}try{navigator.vibrate&&navigator.vibrate([200,100,200])}catch(e){}}
+function avisos(){
+ api('approvals').then(function(rows){PEND=rows.filter(function(r){return r.status==='pending'}).length;badge()}).catch(function(){});
+ api('notifs').then(function(d){
+  fill($('#nts'),d.items,function(it,r){it.appendChild(el('b',(r.level==='ok'?'✅ ':r.level==='warn'?'⚠️ ':r.level==='error'?'⛔ ':'🔔 ')+r.title));if(!r.seen)it.appendChild(el('span','nuevo','tag'));if(r.text)it.appendChild(el('div',r.text));it.appendChild(el('small',r.who+' · hace '+ago(r.t)))});
+  $('#nst').textContent=d.push?'Avisos al teléfono: activados ✓':'Avisos al teléfono: sin configurar (por ahora solo los ves aquí).';
+  UNSEEN=d.unseen;badge();
+  var nag=d.items.filter(function(r){return r.nag&&!r.seen}),bar=$('#nagbar');
+  if(nag.length){bar.hidden=false;bar.textContent='🔔 '+nag[0].title+(nag.length>1?' (+'+(nag.length-1)+' más)':'')+' · toca para marcarlo como visto';bar.onclick=function(){api('notif-seen',{}).then(avisos)};if(!NAGT){beep();NAGT=setInterval(beep,20000)}}
+  else{bar.hidden=true;if(NAGT){clearInterval(NAGT);NAGT=null}}}).catch(fail)}
+$('#nall').onclick=function(){api('notif-seen',{}).then(avisos)};
+$('#ntest').onclick=function(){api('notif-test',{}).then(avisos).catch(function(e){alert(e.message)})};
+var GL={'web.fetch':'Leer páginas web','webhook.send':'Enviar datos a un webhook','notes.delete':'Borrar notas','connectors.add':'Añadir conectores','connectors.call':'Ejecutar acciones en conectores (POST, PUT, DELETE)','connectors.remove':'Quitar conectores'};
+function grant(){api('grant-get').then(function(g){var box=$('#gtl');
+ if(!box.children.length){Object.keys(GL).forEach(function(k){var l=el('label',null,'row'),c=document.createElement('input');c.type='checkbox';c.value=k;c.checked=(k==='web.fetch'||k==='connectors.call');l.append(c,el('span',GL[k]));box.appendChild(l)})}
+ $('#gst').replaceChildren(el('div',g.active?'✅ Activo hasta las '+new Date(g.until).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+': '+g.tools.map(function(t){return GL[t]}).join(', '):'Apagado: todo lo sensible pide tu botón.',g.active?'good':''))}).catch(fail)}
+$('#gon').onclick=function(){var t=[].slice.call(document.querySelectorAll('#gtl input:checked')).map(function(x){return x.value});api('grant-set',{hours:Number($('#gh').value),tools:t}).then(function(){$('#gerr').textContent='';grant()}).catch(function(e){$('#gerr').textContent=e.message})};
+$('#goff').onclick=function(){api('grant-off',{}).then(grant)};
+var CP=[];
+function conn(){api('connectors').then(function(d){CP=d.plantillas;
+ var sel=$('#cpre');if(!sel.children.length){var o=el('option','Empezar desde una plantilla (opcional)…');o.value='';sel.appendChild(o);CP.forEach(function(p){var op=el('option',p.nombre+' · '+p.tipo);op.value=p.nombre;sel.appendChild(op)});d.tipos.forEach(function(k){var op=el('option',k);op.value=k;$('#ck').appendChild(op)});$('#ck').value='rest'}
+ fill($('#cls'),d.items,function(it,r){it.appendChild(el('b','🔌 '+r.nombre));it.appendChild(el('span',r.tipo,'tag'));it.appendChild(el('div',r.url));
+  var nm=r.secreto.split(' ')[0];it.appendChild(el('div',r.secreto==='ninguno'?'Sin clave':r.secreto_configurado?'Clave '+nm+' lista ✓':'FALTA crear el secreto '+nm+' en Cloudflare',r.secreto!=='ninguno'&&!r.secreto_configurado?'err':'good'));
+  if(r.ultima_prueba)it.appendChild(el('small',(r.ultima_prueba.ok?'✓ ':'✗ ')+r.ultima_prueba.info+' (hace '+r.ultima_prueba.hace_min+' min)'));
+  var w=el('div',null,'row'),t=el('button','Probar','pri'),x=el('button','Quitar','no');
+  t.onclick=function(){t.disabled=true;t.textContent='Probando…';api('connector-test',{name:r.nombre}).then(function(z){alert((z.ok?'✓ ':'✗ ')+z.diagnostico+' ('+z.ms+' ms)');conn()}).catch(function(e){alert(e.message);conn()})};
+  x.onclick=function(){if(confirm('¿Quitar el conector '+r.nombre+'?'))api('connector-remove',{name:r.nombre}).then(conn)};
+  w.append(t,x);it.appendChild(w)})}).catch(fail)}
+$('#cpre').onchange=function(){var p=CP.filter(function(x){return x.nombre===$('#cpre').value})[0];if(!p)return;$('#cn').value=p.nombre;$('#cu').value=p.url;$('#ck').value=p.tipo;$('#ce').value=p.auth_env||'';$('#cm').value=p.auth_mode||'none';$('#cnote').value=p.nota||''};
+$('#cadd').onclick=function(){var e=$('#cerr');e.className='err';e.textContent='';api('connector-add',{name:$('#cn').value,url:$('#cu').value,kind:$('#ck').value,auth_env:$('#ce').value,auth_mode:$('#cm').value,notes:$('#cnote').value}).then(function(r){e.className='good';e.textContent='Guardado. Secreto: '+r.secreto+'. '+r.siguiente_paso;conn()}).catch(function(x){e.textContent=x.message})};
+function snaps(f){api('snap-list',{id:f.id}).then(function(rows){var box=$('#hist');box.replaceChildren();box.appendChild(el('h2','Copias de '+f.name));
+ var mk=el('button','Guardar una copia ahora','pri');mk.onclick=function(){api('snap-create',{id:f.id,label:'desde el panel'}).then(function(){snaps(f)}).catch(function(e){alert(e.message)})};box.appendChild(mk);
+ if(!rows.length)box.appendChild(el('p','Todavía no hay copias de este archivo.'));
+ rows.forEach(function(r){var d=el('div',null,'item');d.appendChild(el('b',(r.label||'(sin nombre)')+' · '+r.who+' · hace '+ago(r.t)));d.appendChild(el('span',r.chars+' caracteres · v'+r.ver,'tag'));
+  var u=el('button','Restaurar esta copia','no');u.onclick=function(){if(confirm('¿Volver a esta copia? Antes se guarda automáticamente el estado actual, así que también se puede deshacer.'))api('snap-restore',{id:f.id,snap:r.id}).then(function(){alert('Listo: archivo restaurado.');snaps(f);refresh()}).catch(function(e){alert(e.message)})};d.appendChild(u);box.appendChild(d)});
+ box.scrollIntoView()}).catch(function(e){alert(e.message)})}
+function openExt(id){api('preview-link',{id:id}).then(function(x){if(window.UABNative&&UABNative.openExternal){UABNative.openExternal(x.url)}else{window.open(x.url,'_blank')}}).catch(function(e){alert(e.message)})}
+$('#lext').onclick=function(){if(LIVE)openExt(LIVE.id)};
+var T0='inicio';try{T0=sessionStorage.getItem('uab_tab')||'inicio'}catch(e){}showTab(T0);
 if(KEY){enter()}
 </script></body></html>`;
 
@@ -1547,6 +1662,7 @@ export default {
       if (!env.DB) return text('Falta el binding D1 llamado DB.', 500);
       await ensureSchema(env);
       if ((segs[1] === 'c' || segs[1] === 'r') && request.method === 'OPTIONS') return new Response(null, {status: 204, headers: {...BASE_HEADERS, ...CORS, 'access-control-max-age': '86400'}});
+      if (segs[1] === 'v' && request.method === 'GET') return await handleView(request, env, url, segs);
       if (segs[1] === 'mcp') return await handleMcp(request, env, ctx, url, segs);
       if (segs[1] === 'c' && request.method === 'GET') return await handleCall(request, env, ctx, url, segs);
       if (segs[1] === 'r' && request.method === 'GET') return await handleStatus(request, env, url, segs);
