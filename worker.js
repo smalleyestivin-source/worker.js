@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.12.0';
+const VERSION = '0.12.1';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -44,6 +44,7 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)',
   'CREATE TABLE IF NOT EXISTS wakelog (label TEXT PRIMARY KEY, last INTEGER, unanswered INTEGER DEFAULT 0, hold INTEGER DEFAULT 0, hour_start INTEGER DEFAULT 0, n_hour INTEGER DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS ctools (name TEXT PRIMARY KEY, desc TEXT, params TEXT, steps TEXT, risk TEXT, owner TEXT, enabled INTEGER DEFAULT 1, created INTEGER, uses INTEGER DEFAULT 0)',
+  'CREATE TABLE IF NOT EXISTS wakeseen (label TEXT PRIMARY KEY, t INTEGER, motivo TEXT, wake INTEGER DEFAULT 0, v TEXT)',
   'CREATE INDEX IF NOT EXISTS ix_fsnap_file ON fsnap(file, t)',
   'CREATE INDEX IF NOT EXISTS ix_notifs_seen ON notifs(dest, seen, id)',
   'CREATE INDEX IF NOT EXISTS ix_fhist_file ON fhist(file, id)',
@@ -1215,17 +1216,23 @@ async function wakeGet(env) {
   const r = await env.DB.prepare("SELECT v FROM settings WHERE k = 'wake'").first();
   let g = {}; try { if (r) g = JSON.parse(r.v); } catch {}
   const until = Number(g.until) || 0;
-  return {until, active: until > Date.now()};
+  return {until, since: Number(g.since) || 0, active: until > Date.now()};
+}
+// Mientras el modo autónomo está activo, los enlaces de las IA no deben vencerse a mitad de la noche.
+async function wakeExtendTokens(env, until) {
+  const r = await env.DB.prepare('UPDATE tokens SET expires = ? WHERE revoked = 0 AND expires < ? AND expires > ?').bind(until, until, Date.now() - 24 * 3600e3).run();
+  return r.meta.changes;
 }
 // Lo llama la app (cada ~40 s) en nombre de cada pestaña: dice si hay que escribirle un mensaje a esa IA para que despierte.
-async function wakeCheck(env, tok, rawTk, label, who) {
+async function wakeCheck(env, tok, rawTk, label, who, v) {
   const now = Date.now(), w = await wakeGet(env);
-  if (!w.active) return {wake: false, permiso: false, motivo: 'El usuario no ha dado permiso para despertar a las IA.'};
-  if (tok.scope === 'read') return {wake: false, motivo: 'enlace de solo lectura'};
+  const seen = async (r) => { try { await env.DB.prepare('INSERT INTO wakeseen (label, t, motivo, wake, v) VALUES (?,?,?,?,?) ON CONFLICT(label) DO UPDATE SET t = excluded.t, motivo = excluded.motivo, wake = excluded.wake, v = excluded.v').bind(label, now, clip(r.motivo || '', 120), r.wake ? 1 : 0, clip(v || '', 10)).run(); } catch {} return r; };
+  if (!w.active) return seen({wake: false, permiso: false, motivo: 'El usuario no ha dado permiso para despertar a las IA.'});
+  if (tok.scope === 'read') return seen({wake: false, motivo: 'enlace de solo lectura'});
   const st = await env.DB.prepare('SELECT status, until FROM aistate WHERE label = ?').bind(label).first();
-  if (st && st.status === 'limite' && (!st.until || st.until > now)) return {wake: false, motivo: 'esta IA avisó que no tiene límites'};
+  if (st && st.status === 'limite' && (!st.until || st.until > now)) return seen({wake: false, motivo: 'esta IA avisó que no tiene límites'});
   const last = (await env.DB.prepare("SELECT MAX(t) t FROM logs WHERE token = ? AND label IS ? AND kind = 'call'").bind(rawTk, label).first()).t || 0;
-  if (now - last < 150000) return {wake: false, motivo: 'está trabajando'};
+  if (now - last < 150000) return seen({wake: false, motivo: 'está trabajando'});
   const why = []; let hint = '';
   if (tok.scope === 'super') {
     const ord = (await env.DB.prepare('SELECT COUNT(*) c FROM sorders WHERE done = 0').first()).c;
@@ -1242,22 +1249,22 @@ async function wakeCheck(env, tok, rawTk, label, who) {
     if (mine && now - last > 8 * 60000) { why.push('tienes la tarea ' + mine.id + ' (' + mine.role + ') sin terminar'); hint = 'Continúala con las herramientas y termina con tasks.done. Si no puedes seguir, usa ai.report.'; }
     else if (!mine && open) { why.push('hay ' + open + ' tarea(s) libre(s)'); hint = 'Llama tasks.list, toma una con tasks.claim, trabájala y termina con tasks.done. Si ya no hay nada, responde solo: Listo.'; }
   }
-  if (!why.length) return {wake: false, motivo: 'no hay nada pendiente'};
+  if (!why.length) return seen({wake: false, motivo: 'no hay nada pendiente'});
   const row = await env.DB.prepare('SELECT last, unanswered, hold, hour_start, n_hour FROM wakelog WHERE label = ?').bind(label).first();
-  if (row && row.hold > now) return {wake: false, motivo: 'en pausa: no respondió a los avisos anteriores'};
-  if (row && now - row.last < WAKE_GAP) return {wake: false, motivo: 'se le avisó hace poco'};
+  if (row && row.hold > now) return seen({wake: false, motivo: 'en pausa: no respondió a los avisos anteriores'});
+  if (row && now - row.last < WAKE_GAP) return seen({wake: false, motivo: 'se le avisó hace poco'});
   const un = row ? (last >= row.last ? 0 : row.unanswered) : 0;
   if (un >= WAKE_MAX_UNANSWERED) {
     await env.DB.prepare('UPDATE wakelog SET hold = ?, unanswered = 0 WHERE label = ?').bind(now + WAKE_HOLD, label).run();
     await addNotif(env, {who: 'despertador', level: 'warn', title: label + ' no responde a los avisos', text: 'Le escribí ' + WAKE_MAX_UNANSWERED + ' veces y no usó ninguna herramienta. Pausé sus avisos 30 minutos. Quizá se quedó sin límites o el chat se atascó.', dest: 'usuario'});
-    return {wake: false, motivo: 'no responde: pausada 30 minutos'};
+    return seen({wake: false, motivo: 'no responde: pausada 30 minutos'});
   }
   const hs = row && now - row.hour_start < 3600000 ? row.hour_start : now, nh = row && now - row.hour_start < 3600000 ? row.n_hour : 0;
-  if (nh >= WAKE_PER_HOUR) return {wake: false, motivo: 'máximo de avisos por hora'};
+  if (nh >= WAKE_PER_HOUR) return seen({wake: false, motivo: 'máximo de avisos por hora'});
   await env.DB.prepare('INSERT INTO wakelog (label, last, unanswered, hold, hour_start, n_hour) VALUES (?,?,?,?,?,?) ON CONFLICT(label) DO UPDATE SET last = excluded.last, unanswered = excluded.unanswered, hour_start = excluded.hour_start, n_hour = excluded.n_hour')
     .bind(label, now, un + 1, row ? row.hold : 0, hs, nh + 1).run();
   const motivo = why.join('; ');
-  return {wake: true, motivo, texto: '[SISTEMA UAB] Despertar: ' + motivo + '. ' + hint};
+  return seen({wake: true, motivo, texto: '[SISTEMA UAB] Despertar: ' + motivo + '. ' + hint});
 }
 
 /* ---------- v0.12: herramientas propias (las crea el usuario o, con permiso, una IA) ---------- */
@@ -1389,7 +1396,8 @@ async function handleAdminApi(request, env, url, segs) {
   switch (segs[3]) {
     case 'new-token': {
       const token = rand(16), label = clip(b.label || 'ia', 30), hours = num(b.hours, 24, 1, 720), scope = b.scope === 'read' ? 'read' : b.scope === 'super' ? 'super' : 'write';
-      await env.DB.prepare('INSERT INTO tokens (token, label, scope, expires, created) VALUES (?,?,?,?,?)').bind(token, label, scope, Date.now() + hours * 36e5, Date.now()).run();
+      const wk = await wakeGet(env);
+      await env.DB.prepare('INSERT INTO tokens (token, label, scope, expires, created) VALUES (?,?,?,?,?)').bind(token, label, scope, Math.max(Date.now() + hours * 36e5, wk.active ? wk.until : 0), Date.now()).run();
       if (ROLE_TEXT[b.role]) await env.DB.prepare('INSERT OR REPLACE INTO troles (token, role) VALUES (?,?)').bind(token.slice(0, 8), b.role).run();
       await addLog(env, {token: token.slice(0, 8), label, kind: 'admin', status: 'ok', detail: 'Enlace creado (' + scope + ', ' + hours + ' h)'});
       return json({link_base: url.origin + '/c/' + token + '/', mcp_url: url.origin + '/mcp/' + token + '/', instructions: instructions(url.origin, token) + (scope === 'super' ? '\n\n' + SUPER_TEXT : '')});
@@ -1534,9 +1542,9 @@ async function handleAdminApi(request, env, url, segs) {
     }
     case 'wake-state': {
       const w = await wakeGet(env);
-      return json({...w, ias: (await env.DB.prepare('SELECT label, last, unanswered, hold FROM wakelog ORDER BY last DESC LIMIT 12').all()).results});
+      return json({...w, ias: (await env.DB.prepare('SELECT label, last, unanswered, hold FROM wakelog ORDER BY last DESC LIMIT 12').all()).results, app: (await env.DB.prepare('SELECT label, t, motivo, wake, v FROM wakeseen ORDER BY t DESC LIMIT 12').all()).results});
     }
-    case 'wake-set': { const h = num(b.hours, 4, 1, 24); await env.DB.prepare("INSERT INTO settings (k, v) VALUES ('wake', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(JSON.stringify({until: Date.now() + h * 36e5})).run(); await addLog(env, {kind: 'admin', status: 'ok', detail: 'Modo autónomo activado por ' + h + ' h'}); return json({ok: true, ...(await wakeGet(env))}); }
+    case 'wake-set': { const h = num(b.hours, 4, 1, 24), until = Date.now() + h * 36e5; await env.DB.prepare("INSERT INTO settings (k, v) VALUES ('wake', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(JSON.stringify({until, since: Date.now()})).run(); const ext = await wakeExtendTokens(env, until); await addLog(env, {kind: 'admin', status: 'ok', detail: 'Modo autónomo activado por ' + h + ' h (' + ext + ' enlaces extendidos)'}); return json({ok: true, enlaces_extendidos: ext, ...(await wakeGet(env))}); }
     case 'wake-off': { await env.DB.prepare("DELETE FROM settings WHERE k = 'wake'").run(); await env.DB.prepare('DELETE FROM wakelog').run(); return json({ok: true}); }
     case 'ctool-list': return json({items: await ctPublic(env), conectores: (await connList(env)).map(x => x.nombre), herramientas: Object.keys(TOOLS).filter(t => !CT_FORBID.has(t)).sort()});
     case 'ctool-save': try { return json({ok: true, ...(await ctSave(env, b, 'usuario', true))}); } catch (e) { return json({error: String(e.message || e)}, 400); }
@@ -1843,7 +1851,10 @@ function dlDoc(name,text){if(window.UABNative){if(UABNative.panelOk){UABNative.s
 
 function wake(){api('wake-state').then(function(d){
  $('#wst').replaceChildren(el('div',d.active?'✅ Activo hasta las '+new Date(d.until).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'Apagado: las IA solo trabajan cuando tú o su app les escriben.',d.active?'good':''));
- fill($('#wls2'),d.ias,function(it,r){it.appendChild(el('b','⏰ '+r.label));it.appendChild(el('span',r.hold>Date.now()?'en pausa (no responde)':'último aviso hace '+ago(r.last),'tag'))})}).catch(fail)}
+ var box=$('#wls2');box.replaceChildren();
+ if(d.active&&!d.app.length)box.appendChild(el('div','⚠ La app todavía no ha consultado nada. Instala la app 0.10, ábrela y entra al chat de la IA (el que ya tenga las instrucciones).','err'));
+ d.app.forEach(function(r){var it=el('div',null,'item');it.appendChild(el('b','📡 '+r.label));it.appendChild(el('span','app v'+(r.v||'?')+' · hace '+ago(r.t),'tag'));it.appendChild(el('div',(r.wake?'Le escribió: ':'Estado: ')+r.motivo,r.label.indexOf('⚠')===0?'err':''));box.appendChild(it)});
+ d.ias.forEach(function(r){var it=el('div',null,'item');it.appendChild(el('b','⏰ '+r.label));it.appendChild(el('span',r.hold>Date.now()?'en pausa (no responde)':'último aviso hace '+ago(r.last),'tag'));box.appendChild(it)})}).catch(fail)}
 $('#won').onclick=function(){api('wake-set',{hours:Number($('#wh').value)}).then(wake).catch(function(e){alert(e.message)})};
 $('#woff').onclick=function(){api('wake-off',{}).then(wake)};
 var CTL=null;
@@ -1878,9 +1889,12 @@ export default {
       if ((segs[1] === 'c' || segs[1] === 'r') && request.method === 'OPTIONS') return new Response(null, {status: 204, headers: {...BASE_HEADERS, ...CORS, 'access-control-max-age': '86400'}});
       if (segs[1] === 'w' && request.method === 'GET') {
         const raw = segs[2] || '', tok = await getToken(env, raw);
-        if (!tok) return out({wake: false, error: 'Token no válido'});
+        if (!tok) {
+          try { await env.DB.prepare('INSERT INTO wakeseen (label, t, motivo, wake, v) VALUES (?,?,?,0,?) ON CONFLICT(label) DO UPDATE SET t = excluded.t').bind('⚠ enlace vencido o inválido (' + clip(raw, 8) + ')', Date.now(), 'El enlace que usa la app ya no sirve: crea uno nuevo y pégalo en la app.', clip(url.searchParams.get('v') || '', 10)).run(); } catch {}
+          return out({wake: false, error: 'Token no válido, vencido o revocado.'});
+        }
         const who = /^[a-z0-9_-]{1,30}$/i.test(url.searchParams.get('who') || '') ? url.searchParams.get('who').toLowerCase() : '', lbl = who ? tok.label + '/' + who : tok.label;
-        return out(await wakeCheck(env, tok, raw.slice(0, 8), lbl, who));
+        return out(await wakeCheck(env, tok, raw.slice(0, 8), lbl, who, clip(url.searchParams.get('v') || '', 10)));
       }
       if (segs[1] === 'v' && request.method === 'GET') return await handleView(request, env, url, segs);
       if (segs[1] === 'mcp') return await handleMcp(request, env, ctx, url, segs);
