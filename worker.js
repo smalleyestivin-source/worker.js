@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.13.0';
+const VERSION = '0.14.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -237,6 +237,7 @@ function outline(name, text) {
   if (/\.css$/i.test(name)) for (const m of text.matchAll(/^([^\n{}@][^{}\n]{0,60})\s*\{/gm)) push(m.index, 'selector', m[1].trim());
   return out.sort((a, b) => a.linea - b.linea);
 }
+const SAVE_TEXT = ' AHORRA LLAMADAS (tus límites son limitados): (1) agrupa varias herramientas en UN solo bloque o usa batch.run (hasta 12 a la vez); (2) para revisar usa code.review (una llamada: prueba el archivo y comprueba si funciones o ids existen) en vez de varias; (3) para ver cuánto pesa o qué sobra usa code.slim, y files.minify crea una copia más ligera sin tocar el original; (4) lee solo lo necesario con files.lines / term.run (grep, head) y no archivos enteros.';
 const SUPER_TEXT = 'ERES EL SUPERVISOR (modo maestro) de este proyecto. El usuario es el líder: tú guías al equipo y él te da órdenes. Tienes permiso por tiempo limitado (termina cuando venza tu enlace); sin permiso no puedes hacer nada. ' +
   'CICLO: 1) Llama super.watch (espera hasta 15 s) y repite con since = el valor «ahora». Si trae «ordenes», esa es tu misión: léela completa. ' +
   '2) Con una orden nueva: revisa el proyecto (project.check, files.list, files.outline), haz un plan corto y reparte el trabajo con tasks.create, una tarea por cosa y con role = servidor, interfaz o javascript según corresponda (cada IA solo toma tareas de su rol). Si no hay orden, no inventes trabajo grande: solo vigila, revisa lo que se entregó y arregla errores pequeños. ' +
@@ -674,9 +675,9 @@ const TOOLS = {
     }
   }},
   'meta.role': {risk: 'read', desc: 'Devuelve tu rol y reglas especiales (si tu enlace tiene un rol).', args: '', run: async (a, c) => {
-    if (c.scope === 'super') return {texto: SUPER_TEXT, supervisor: true};
+    if (c.scope === 'super') return {texto: SUPER_TEXT + SAVE_TEXT, supervisor: true};
     const r = await c.env.DB.prepare('SELECT role FROM troles WHERE token = ?').bind(c.rawTk).first();
-    return {texto: (r && ROLE_TEXT[r.role] ? 'TU ROL: ' + ROLE_TEXT[r.role] + '.' : '') + TEAM_RULES, rol: r ? r.role : 'general', supervisor: false};
+    return {texto: (r && ROLE_TEXT[r.role] ? 'TU ROL: ' + ROLE_TEXT[r.role] + '.' : '') + TEAM_RULES + SAVE_TEXT, rol: r ? r.role : 'general', supervisor: false};
   }},
   'files.lines': {risk: 'read', desc: 'Lee solo unas líneas de un archivo (con su número). Ideal para ir a la línea que dice un error.', args: 'file, from, to? (máx. 120 líneas)', run: async (a, c) => {
     const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join(''), L = text.split('\n');
@@ -697,6 +698,16 @@ const TOOLS = {
     const probs = crossCheck(files), rev = files.map(f => ({archivo: f.name, lineas: f.text.split('\n').length, caracteres: f.text.length, linea_mas_larga: Math.max(...f.text.split('\n').map(l => l.length))}));
     const gigantes = rev.filter(r => r.linea_mas_larga > 2000).map(r => r.archivo);
     return {archivos_revisados: files.length, problemas: probs, ok: probs.length === 0, archivos: rev.slice(0, 40), aviso_lineas_gigantes: gigantes.length ? 'Estos archivos tienen líneas enormes (código en una sola línea), lo que dificulta editar y localizar errores: ' + gigantes.join(', ') : undefined, nota: 'Son avisos automáticos por lectura del texto: confirma cada uno antes de cambiar algo.'};
+  }},
+  'batch.run': {risk: 'read', untrusted: true, desc: 'AHORRA LLAMADAS: ejecuta hasta 12 herramientas en UNA sola llamada y devuelve todos los resultados juntos. No admite las que piden aprobación (esas van solas).', args: 'calls (lista JSON [{"tool":"files.lines","args":{...}},...]), parar_si_falla? (true/false)', run: (a, c) => batchRun(c, a)},
+  'code.review': {risk: 'read', untrusted: true, desc: 'REVISIÓN EN UNA LLAMADA: prueba un archivo (errores de estructura/sintaxis, ids repetidos, enlaces rotos) Y comprueba si ciertas funciones o ids EXISTEN en el proyecto (dónde se definen y cuántas veces aparecen). Úsalo antes y después de editar para saber que no dañaste nada.', args: 'file?, exists? (nombres de funciones o ids separados por |)', run: (a, c) => codeReview(c, a)},
+  'code.slim': {risk: 'read', desc: 'ANÁLISIS DE PESO de un archivo en una llamada: cuánto bajaría al minificar, imágenes base64 incrustadas, líneas y bloques repetidos, funciones largas, funciones sin uso y CSS sin usar, con consejos. No modifica nada.', args: 'file', run: (a, c) => codeSlim(c, a)},
+  'files.minify': {risk: 'write', desc: 'Crea una COPIA más ligera de un .js, .css o .html (sin comentarios ni espacios sobrantes; no cambia nombres ni lógica) con nombre nombre.min.ext. NUNCA toca el original. Si la copia quedara con más errores de estructura que el original, no la crea.', args: 'file', run: async (a, c) => {
+    const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join(''), min = minifyText(f.name, text);
+    if (min === text) return {creado: false, motivo: 'No se pudo reducir con seguridad (o ya está mínimo).'};
+    const nm = f.name.replace(/(\.[^.\/]+)$/, '.min$1'); if (nm === f.name) throw new Error('El archivo ya es una versión .min.');
+    const p = await putFileRaw(c.env, nm, min);
+    return {creado: true, archivo_nuevo: nm, id: p.id, antes: text.length, despues: min.length, ahorro_porcentaje: Math.round((1 - min.length / text.length) * 100), nota: 'Las líneas cambian de número. Prueba con files.test y la vista previa antes de usarlo. El original no se tocó.'};
   }},
   'term.run': {risk: 'read', untrusted: true, desc: 'Terminal virtual de SOLO LECTURA sobre los archivos del proyecto (no ejecuta programas). Comandos: echo, ls [prefijo], find texto, stat archivo, cat [-n] archivo, head/tail -n N archivo, wc [-l], grep [-i -n -c -v -E] patrón [archivo], sort [-n -r], uniq [-c], sed s/a/b/g [archivo], diff a b. Se unen con |. Ej: grep -n fetch app.js | head -5', args: 'cmd', run: async (a, c) => ({salida: await termRun(c.env, a.cmd)})},
   'files.list': {risk: 'read', desc: 'Lista los archivos del proyecto (nombre con su ruta, tamaño y versión). Usa prefix para ver solo una carpeta, por ejemplo prefix=src/.', args: 'prefix?, limit? (1-100, por defecto 50)', run: async (a, c) => {
@@ -1404,6 +1415,170 @@ async function termRun(env, line) {
     input = String(o);
   }
   return input.length > 12000 ? input.slice(0, 12000) + '\n… (recortado; filtra con grep/head)' : input;
+}
+
+/* ----- v0.14: menos llamadas y código más liviano ----- */
+// Quita comentarios y espacios de JS sin tocar textos, plantillas ni expresiones regulares. No cambia nombres ni el orden del código.
+function stripJs(src) {
+  const n = src.length; let i = 0, out = '';
+  const KW = new Set(['return', 'typeof', 'case', 'in', 'of', 'void', 'delete', 'throw', 'new', 'else', 'do', 'instanceof', 'yield', 'await']);
+  const trimEnd = () => { out = out.replace(/[ \t]+$/, ''); };
+  function tmpl() {
+    out += '`';
+    while (i < n) {
+      const ch = src[i];
+      if (ch === '\\') { out += src.substr(i, 2); i += 2; continue; }
+      if (ch === '`') { out += ch; i++; return; }
+      if (ch === '$' && src[i + 1] === '{') { out += '${'; i += 2; code(true); out += '}'; continue; }
+      out += ch; i++;
+    }
+  }
+  function code(inner) {
+    let depth = 0, last = '';
+    while (i < n) {
+      const ch = src[i], nx = src[i + 1];
+      if (ch === '/' && nx === '/') { let j = i; while (j < n && src[j] !== '\n') j++; const cm = src.slice(i, j); if (/^\/\/\s*(==|@)/.test(cm)) out += cm; i = j; continue; }
+      if (ch === '/' && nx === '*') { let j = src.indexOf('*/', i + 2); j = j < 0 ? n : j + 2; const cm = src.slice(i, j); if (/^\/\*!|@license|@preserve/.test(cm)) out += cm; else out += cm.includes('\n') ? '\n' : ' '; i = j; continue; }
+      if (ch === '"' || ch === "'") { let j = i + 1; while (j < n && src[j] !== ch && src[j] !== '\n') { if (src[j] === '\\') j++; j++; } out += src.slice(i, j + 1); i = j + 1; last = ch; continue; }
+      if (ch === '`') { i++; tmpl(); last = '`'; continue; }
+      if (ch === '\n') { trimEnd(); if (out !== '' && !out.endsWith('\n')) out += '\n'; i++; continue; }
+      if (ch === ' ' || ch === '\t' || ch === '\r') { if (out !== '' && !out.endsWith('\n') && !out.endsWith(' ')) out += ' '; i++; continue; }
+      if (ch === '{') depth++;
+      if (ch === '}') { if (inner && depth === 0) { trimEnd(); i++; return; } depth--; }
+      if (ch === '/' && (last === '' || '(,=:[!&|?{};+-*%<>~^'.includes(last) || KW.has(last))) {
+        let j = i + 1, cls = false;
+        while (j < n && src[j] !== '\n') { const c2 = src[j]; if (c2 === '\\') { j += 2; continue; } if (c2 === '[') cls = true; else if (c2 === ']') cls = false; else if (c2 === '/' && !cls) break; j++; }
+        if (j < n && src[j] === '/') { j++; while (j < n && /[a-z]/i.test(src[j])) j++; out += src.slice(i, j); i = j; last = ')'; continue; }
+      }
+      const w = /^[A-Za-z_$][\w$]*/.exec(src.slice(i, i + 80));
+      if (w) { out += w[0]; i += w[0].length; last = w[0]; continue; }
+      out += ch; last = ch; i++;
+    }
+  }
+  code(false); trimEnd();
+  return out.replace(/^\n+/, '').replace(/\n+$/, '\n');
+}
+function stripCss(src) {
+  let out = '', i = 0; const n = src.length;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === '/' && src[i + 1] === '*') { const j = src.indexOf('*/', i + 2); i = j < 0 ? n : j + 2; continue; }
+    if (ch === '"' || ch === "'") { let j = i + 1; while (j < n && src[j] !== ch) { if (src[j] === '\\') j++; j++; } out += src.slice(i, j + 1); i = j + 1; continue; }
+    if (ch === 'u' && /^url\(\s*[^"')\s]/i.test(src.slice(i, i + 12))) { const j = src.indexOf(')', i); const e = j < 0 ? n : j + 1; out += src.slice(i, e); i = e; continue; }
+    if (/\s/.test(ch)) { while (i < n && /\s/.test(src[i])) i++; const p = out[out.length - 1], q = src[i]; if (out && q && !'{};,:>~'.includes(p) && !'{};,>~)'.includes(q)) out += ' '; continue; }
+    out += ch; i++;
+  }
+  return out.replace(/;}/g, '}').trim() + '\n';
+}
+function minifyText(name, text) {
+  const ext = name.toLowerCase().split('.').pop();
+  if (['js', 'mjs'].includes(ext)) { const o = stripJs(text); return bracketScan(o, 1, true).length > bracketScan(text, 1, true).length ? text : o; }
+  if (ext === 'css') { const o = stripCss(text); return cssScan(o).length > cssScan(text).length ? text : o; }
+  if (ext === 'html' || ext === 'htm') {
+    const hold = [];
+    let t = text.replace(/(<script\b([^>]*)>)([\s\S]*?)(<\/script>)/gi, (m, o, attrs, body, c) => {
+      let nb = body; if (!/\bsrc\s*=/.test(attrs) && (!/\btype\s*=/.test(attrs) || /javascript|module/i.test(attrs))) { const s2 = stripJs(body); if (bracketScan(s2, 1, true).length <= bracketScan(body, 1, true).length) nb = s2; }
+      hold.push(o + nb + c); return '\u0000' + (hold.length - 1) + '\u0000';
+    });
+    t = t.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, (m, o, body, c) => { const s2 = stripCss(body); hold.push(o + (cssScan(s2).length <= cssScan(body).length ? s2 : body) + c); return '\u0000' + (hold.length - 1) + '\u0000'; });
+    t = t.replace(/<!--(?!\[if)[\s\S]*?-->/g, '');
+    if (!/<pre\b|<textarea\b/i.test(t)) t = t.split('\n').map(l => l.trim()).filter(Boolean).join('\n') + '\n';
+    return t.replace(/\u0000(\d+)\u0000/g, (m, k) => hold[Number(k)]);
+  }
+  throw new Error('Solo se puede minificar .js, .css y .html (este es .' + ext + ').');
+}
+async function putFileRaw(env, name, body) {
+  if (body.length > FILE_MAX) throw new Error('Resultado demasiado grande.');
+  const prev = await env.DB.prepare('SELECT id FROM files WHERE lower(name) = lower(?) ORDER BY created DESC LIMIT 1').bind(name).first();
+  if (!prev) { const cnt = (await env.DB.prepare('SELECT COUNT(*) c FROM files').first()).c; if (cnt >= FILES_MAX) throw new Error('Límite de ' + FILES_MAX + ' archivos. Borra alguno.'); }
+  const id = prev ? prev.id : rand(4), parts = splitParts(body), stm = [];
+  if (prev) stm.push(env.DB.prepare('DELETE FROM fparts WHERE file = ?').bind(id), env.DB.prepare('DELETE FROM fhist WHERE file = ?').bind(id), env.DB.prepare('DELETE FROM flocks WHERE file = ?').bind(id), env.DB.prepare('DELETE FROM files WHERE id = ?').bind(id));
+  stm.push(env.DB.prepare('INSERT INTO files (id, name, chars, parts, created) VALUES (?,?,?,?,?)').bind(id, name, body.length, parts.length, Date.now()));
+  for (let i = 0; i < parts.length; i += 30) { const grp = parts.slice(i, i + 30); stm.push(env.DB.prepare('INSERT INTO fparts (file, n, text) VALUES ' + grp.map(() => '(?,?,?)').join(',')).bind(...grp.flatMap((p, k) => [id, i + k + 1, p]))); }
+  stm.push(env.DB.prepare('INSERT INTO fver (file, ver) VALUES (?,1) ON CONFLICT(file) DO UPDATE SET ver = ver + 1').bind(id));
+  await env.DB.batch(stm);
+  return {id, parts: parts.length};
+}
+async function loadProject(env, keep) {
+  const all = []; let total = 0;
+  for (const r of (await env.DB.prepare('SELECT id, name, chars FROM files ORDER BY name LIMIT 300').all()).results) {
+    if (!/\.(html?|css|m?js)$/i.test(r.name) || total > 2500000) continue;
+    all.push({id: r.id, name: r.name, text: (await loadParts(env, r.id)).map(p => p.text).join('')}); total += r.chars;
+  }
+  return all;
+}
+const defsOf = text => { const out = []; for (const m of text.matchAll(/\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)|\bclass\s+([A-Za-z_$][\w$]*)/g)) out.push({name: m[1] || m[2] || m[3], idx: m.index}); return out; };
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+async function codeReview(c, a) {
+  const names = (Array.isArray(a.exists) ? a.exists : String(a.exists || '').split(/[|,]/)).map(x => String(x).trim()).filter(Boolean).slice(0, 25);
+  const res = {};
+  if (a.file) {
+    const t = await TOOLS['files.test'].run({file: a.file}, c);
+    res.archivo = t.nombre; res.ok = t.ok; res.errores = t.errores; res.avisos = t.avisos; res.resumen = t.resumen;
+    try { const l = await TOOLS['files.lint'].run({file: a.file}, c); res.sintaxis = (l.problemas || l.problems || []).slice(0, 10); if (l.ok === false) res.ok = false; } catch {}
+  }
+  if (names.length) {
+    const proj = await loadProject(c.env); res.existe = {};
+    for (const nm of names) {
+      const re = new RegExp('(?<![\\w$])' + esc(nm) + '(?![\\w$])', 'g'), defs = [], idDefs = []; let usos = 0;
+      for (const f of proj) {
+        for (const d of defsOf(f.text)) if (d.name === nm) defs.push({archivo: f.name, linea: lineOf(f.text, d.idx)});
+        for (const m of f.text.matchAll(new RegExp('\\bid\\s*=\\s*["\']' + esc(nm) + '["\']', 'g'))) idDefs.push({archivo: f.name, linea: lineOf(f.text, m.index)});
+        usos += (f.text.match(re) || []).length;
+      }
+      res.existe[nm] = {existe: defs.length + idDefs.length > 0, definida_en: defs.concat(idDefs).slice(0, 3), apariciones: usos};
+    }
+  }
+  if (!a.file && !names.length) throw new Error('Indica «file» (revisar un archivo) y/o «exists» (nombres de funciones o ids a comprobar, separados por |).');
+  return res;
+}
+async function codeSlim(c, a) {
+  const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join(''), ext = f.name.toLowerCase().split('.').pop();
+  const lines = text.split('\n'), r = {archivo: f.name, caracteres: text.length, lineas: lines.length}, tips = [];
+  try { const m = minifyText(f.name, text); r.minificado = {caracteres: m.length, ahorro: text.length - m.length, porcentaje: Math.round((1 - m.length / Math.max(1, text.length)) * 100)}; if (r.minificado.porcentaje >= 8) tips.push('files.minify crea una copia ' + f.name.replace(/(\.[^.]+)$/, '.min$1') + ' ' + r.minificado.porcentaje + '% más ligera (no toca tu original).'); } catch (e) { r.minificado = e.message; }
+  // datos incrustados
+  const big = []; for (const m of text.matchAll(/data:[a-z\/+.-]+;base64,[A-Za-z0-9+\/=]{1500,}/g)) big.push({linea: lineOf(text, m.index), caracteres: m[0].length});
+  if (big.length) { r.datos_incrustados = big.slice(0, 8); tips.push('Hay ' + big.length + ' imagen(es)/dato(s) base64 grandes dentro del código: sácalos a archivos aparte o comprímelos.'); }
+  // líneas y bloques repetidos
+  const norm = lines.map(l => l.trim()), cnt = new Map();
+  norm.forEach((l, i) => { if (l.length >= 30 && !/^[}\])\/*]/.test(l)) { const e = cnt.get(l) || {n: 0, first: i + 1}; e.n++; cnt.set(l, e); } });
+  const rep = [...cnt.entries()].filter(([, e]) => e.n >= 3).sort((x, y) => y[1].n * y[0].length - x[1].n * x[0].length).slice(0, 6).map(([l, e]) => ({veces: e.n, primera_linea: e.first, texto: l.slice(0, 80)}));
+  if (rep.length) { r.lineas_repetidas = rep; tips.push('Hay líneas idénticas repetidas 3+ veces: puede servir una función o variable común.'); }
+  const win = new Map(); for (let i = 0; i + 4 <= norm.length; i++) { const k = norm.slice(i, i + 4).join('\n'); if (k.length >= 120) { const e = win.get(k) || []; e.push(i + 1); win.set(k, e); } }
+  const blocks = [...win.entries()].filter(([, v]) => v.length >= 2).sort((x, y) => y[1].length * y[0].length - x[1].length * x[0].length).slice(0, 4).map(([k, v]) => ({lineas: v.slice(0, 5), veces: v.length, inicio: k.split('\n')[0].slice(0, 70)}));
+  if (blocks.length) { r.bloques_repetidos = blocks; tips.push('Hay bloques de 4+ líneas copiados en varios sitios: busca unificarlos.'); }
+  if (['js', 'mjs', 'html', 'htm'].includes(ext)) {
+    const defs = defsOf(text), sizes = defs.map((d, k) => ({nombre: d.name, linea: lineOf(text, d.idx), lineas: lineOf(text, defs[k + 1] ? defs[k + 1].idx : text.length) - lineOf(text, d.idx) + 1})).sort((x, y) => y.lineas - x.lineas);
+    r.funciones_mas_largas = sizes.slice(0, 5); if (sizes[0] && sizes[0].lineas > 80) tips.push('La función «' + sizes[0].nombre + '» tiene ' + sizes[0].lineas + ' líneas: conviene partirla.');
+    const proj = await loadProject(c.env), whole = proj.map(p => p.text).join('\n'), unused = [];
+    for (const d of defs) { if (unused.length >= 15) break; const k = (whole.match(new RegExp('(?<![\\w$])' + esc(d.name) + '(?![\\w$])', 'g')) || []).length; if (k <= 1 && d.name.length > 2) unused.push({nombre: d.name, linea: lineOf(text, d.idx)}); }
+    if (unused.length) { r.funciones_sin_uso = unused; tips.push('Funciones que solo aparecen donde se definen (' + unused.length + '): bórralas SOLO tras confirmar con code.review exists=nombre; podrían llamarse desde fuera.'); }
+    if (!proj.some(p => p.name === f.name)) proj.push({name: f.name, text});
+    const css = crossCheck(proj).filter(p => p.archivo === f.name && p.tipo === 'css sin usar').slice(0, 10); if (css.length) { r.css_sin_usar = css.map(p => ({linea: p.linea, mensaje: p.mensaje})); tips.push('Hay CSS que parece no usarse: revisa antes de borrar.'); }
+  }
+  r.consejos = tips.length ? tips : ['Este archivo ya está bastante limpio.'];
+  return r;
+}
+async function batchRun(c, a) {
+  let calls = a.calls; if (typeof calls === 'string') { try { calls = JSON.parse(calls); } catch { throw new Error('«calls» debe ser una lista JSON: [{"tool":"...","args":{...}}].'); } }
+  if (!Array.isArray(calls) || !calls.length) throw new Error('Falta «calls»: una lista de {"tool","args"}.');
+  if (calls.length > 12) throw new Error('Máximo 12 llamadas por batch.run.');
+  const out = []; let size = 0;
+  for (const it of calls) {
+    const tool = String(it && it.tool || ''), args = it && it.args && typeof it.args === 'object' ? it.args : {}, def = TOOLS[tool], t0 = Date.now(); let r;
+    try {
+      if (!def || tool.startsWith('batch.') || tool.startsWith('custom.')) throw new Error(def ? 'Esa herramienta no puede ir dentro de batch.run: llámala sola.' : 'Herramienta desconocida: «' + clip(tool, 40) + '».');
+      if (def.risk !== 'read' && c.scope === 'read') throw new Error('Este enlace es de solo lectura.');
+      if (def.only && def.only !== c.scope) throw new Error('Esta herramienta es solo para el supervisor.');
+      if (c.scope === 'super' && SUPER_NO.includes(tool)) throw new Error('El supervisor no puede usar «' + tool + '».');
+      if (needsApproval(tool, args, c.env)) throw new Error('«' + tool + '» necesita aprobación del usuario: llámala sola, fuera de batch.run.');
+      r = {tool, ok: true, data: await def.run(args, c)};
+    } catch (e) { r = {tool, ok: false, error: String(e.message || e)}; }
+    await addLog(c.env, {token: c.rawTk, label: c.label, kind: 'call', tool, status: r.ok ? 'ok' : 'error', ms: Date.now() - t0, detail: r.ok ? clip(JSON.stringify(args), 140) + ' → ' + clip(JSON.stringify(r.data), 150) : r.error});
+    size += JSON.stringify(r).length; if (size > 60000) { out.push({tool, ok: false, error: 'Se alcanzó el límite de tamaño: el resto no se incluyó. Pídelo en otro batch.'}); break; }
+    out.push(r); if (!r.ok && a.parar_si_falla) break;
+  }
+  return {ejecutadas: out.length, resultados: out};
 }
 
 /* ---------- administración ---------- */
