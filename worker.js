@@ -4,7 +4,7 @@
 // Opcional: variable WEB_AUTO_DOMAINS (dominios separados por comas que web.fetch puede abrir sin aprobación).
 // Novedad v0.2: equipo de IA (archivos por partes, tablero de tareas y mesa de trabajo).
 
-const VERSION = '0.14.0';
+const VERSION = '0.15.0';
 const enc = new TextEncoder();
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async s => hex(await crypto.subtle.digest('SHA-256', enc.encode(s)));
@@ -580,7 +580,7 @@ const TOOLS = {
     const r = await c.env.DB.prepare('SELECT t, kind, tool, status, ms, detail FROM logs WHERE token = ? AND label IS ? ORDER BY id DESC LIMIT ?').bind(c.rawTk || c.tk, c.label, num(a.n, 10, 1, 30)).all();
     return r.results.map(x => ({time: new Date(x.t).toISOString(), tool: x.tool, status: x.status, ms: x.ms, detail: x.detail}));
   }},
-  'date.now': {risk: 'read', desc: 'Fecha y hora actuales del servidor (UTC).', args: '', run: async () => ({iso: new Date().toISOString()})},
+  'date.now': {risk: 'read', desc: 'Fecha y hora actuales (UTC). Si el usuario activó el reloj de la app, devuelve la hora DE LA APP (puede ir más lenta o atrasada): esa es la que debes usar.', args: '', run: async (a, c) => { const k = await clockGet(c.env); return k.on ? {iso: new Date(k.app).toISOString(), reloj_app: true, ritmo: k.speed, atraso_minutos: k.atraso_min} : {iso: new Date().toISOString()}; }},
   'date.diff': {risk: 'read', desc: 'Diferencia entre dos fechas.', args: 'from, to (AAAA-MM-DD o ISO)', run: async a => {
     const f = new Date(need(a.from, 'from')), t = new Date(need(a.to, 'to'));
     if (isNaN(f) || isNaN(t)) throw new Error('Fecha no válida (usa AAAA-MM-DD).');
@@ -675,9 +675,10 @@ const TOOLS = {
     }
   }},
   'meta.role': {risk: 'read', desc: 'Devuelve tu rol y reglas especiales (si tu enlace tiene un rol).', args: '', run: async (a, c) => {
-    if (c.scope === 'super') return {texto: SUPER_TEXT + SAVE_TEXT, supervisor: true};
+    const ck = await clockGet(c.env), CKT = ck.on ? ' RELOJ DE LA APP: aquí el tiempo corre a ritmo ' + ck.speed + ' y va ' + ck.atraso_min + ' min atrasado respecto al real. Para saber la hora usa SIEMPRE date.now; no uses la de tu sistema.' : '';
+    if (c.scope === 'super') return {texto: SUPER_TEXT + SAVE_TEXT + CKT, supervisor: true};
     const r = await c.env.DB.prepare('SELECT role FROM troles WHERE token = ?').bind(c.rawTk).first();
-    return {texto: (r && ROLE_TEXT[r.role] ? 'TU ROL: ' + ROLE_TEXT[r.role] + '.' : '') + TEAM_RULES + SAVE_TEXT, rol: r ? r.role : 'general', supervisor: false};
+    return {texto: (r && ROLE_TEXT[r.role] ? 'TU ROL: ' + ROLE_TEXT[r.role] + '.' : '') + TEAM_RULES + SAVE_TEXT + CKT, rol: r ? r.role : 'general', supervisor: false};
   }},
   'files.lines': {risk: 'read', desc: 'Lee solo unas líneas de un archivo (con su número). Ideal para ir a la línea que dice un error.', args: 'file, from, to? (máx. 120 líneas)', run: async (a, c) => {
     const f = await getFileRow(c.env, a.file), text = (await loadParts(c.env, f.id)).map(p => p.text).join(''), L = text.split('\n');
@@ -1581,6 +1582,15 @@ async function batchRun(c, a) {
   return {ejecutadas: out.length, resultados: out};
 }
 
+/* ----- reloj de la app: lo que las IA creen que es la hora (más lento o atrasado). El tiempo real no cambia ----- */
+async function clockGet(env) {
+  const r = await env.DB.prepare("SELECT v FROM settings WHERE k = 'clock'").first(); let c = null; try { if (r) c = JSON.parse(r.v); } catch {}
+  const now = Date.now();
+  if (!c || !(Number(c.speed) > 0)) return {on: false, real: now, app: now, speed: 1, atraso_min: 0};
+  const speed = Math.min(1, Math.max(0.01, Number(c.speed))), app = Number(c.anchor_app) + (now - Number(c.anchor_real)) * speed;
+  return {on: true, real: now, app, speed, atraso_min: Math.round((now - app) / 60000), anchor_real: Number(c.anchor_real), anchor_app: Number(c.anchor_app)};
+}
+
 /* ---------- administración ---------- */
 function instructions(origin, token) {
   const list = Object.entries(TOOLS).map(([n, t]) => '- ' + n + ' — ' + t.desc + ' Argumentos: ' + (t.args || 'ninguno') + '.').join('\n');
@@ -1645,6 +1655,15 @@ async function handleAdminApi(request, env, url, segs) {
     }
     case 'tokens': return json((await env.DB.prepare('SELECT substr(token, 1, 8) AS tk, label, scope, expires, created, revoked FROM tokens ORDER BY created DESC LIMIT 30').all()).results);
     case 'revoke': { await env.DB.prepare('UPDATE tokens SET revoked = 1 WHERE substr(token, 1, 8) = ?').bind(String(b.tk || '')).run(); return json({ok: true}); }
+    case 'clock-get': return json(await clockGet(env));
+    case 'clock-set': {
+      const speed = num(b.speed, 1, 0.01, 1), delay = num(b.delay_min, 0, 0, 1440), now = Date.now();
+      if (speed >= 1 && delay === 0) { await env.DB.prepare("DELETE FROM settings WHERE k = 'clock'").run(); return json(await clockGet(env)); }
+      await env.DB.prepare("INSERT INTO settings (k, v) VALUES ('clock', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(JSON.stringify({speed, anchor_real: now, anchor_app: now - delay * 60000})).run();
+      await addLog(env, {kind: 'admin', status: 'ok', detail: 'Reloj de la app: ritmo ' + speed + ', atraso ' + delay + ' min'});
+      return json(await clockGet(env));
+    }
+    case 'clock-off': { await env.DB.prepare("DELETE FROM settings WHERE k = 'clock'").run(); return json(await clockGet(env)); }
     case 'feed': {
       const rows = (await env.DB.prepare("SELECT id, t, label, tool, status, ms, detail FROM logs WHERE kind = 'call' ORDER BY id DESC LIMIT ?").bind(num(b.limit, 40, 1, 100)).all()).results;
       return json({now: Date.now(), working: rows.some(r => r.t > Date.now() - 90000), rows});
@@ -1854,6 +1873,7 @@ nav#tabs .bd{position:absolute;top:2px;left:calc(50% + 6px);background:var(--r);
 <div class="row"><input id="ti" placeholder="Instrucción extra (opcional)" style="flex:1;min-width:200px"><button class="pri" id="tn">Crear tarea</button></div><div class="err" id="terr"></div><div id="tls"></div>
 <h2 style="margin-top:14px">Mesa de trabajo</h2><div id="wls"></div><pre id="wview" hidden></pre><div class="row" id="wact" hidden><button id="wcp">Copiar</button><button id="wdl">Descargar</button></div></div>
 <div class="panel" data-t="inicio"><h2>🌅 Modo autónomo (despertar a las IA)</h2><p>Una IA de chat solo responde cuando le llega un mensaje. Con esto activado, la app UAB <b>le escribe sola</b> un mensaje cuando hay trabajo para ella (una orden tuya, una tarea libre, una IA que terminó) y así el maestro y las demás siguen trabajando sin que tú estés. Se apaga solo cuando se acaba el tiempo.</p><div id="wst"></div><div class="row"><select id="wh"><option value="2">2 horas</option><option value="4" selected>4 horas</option><option value="8">8 horas</option><option value="12">12 horas</option><option value="24">24 horas</option></select><button class="pri" id="won">Activar</button><button id="woff">Apagar ya</button></div><div id="wls2"></div><p><small>Importante: funciona solo mientras la app <b>UAB Puente</b> esté abierta en tu tablet con la pantalla encendida (la app ya la mantiene encendida) y con el chat de cada IA abierto en su pestaña. Si apagas la tablet o cierras la app, las IA se quedan quietas: ese es el límite de los chats. Si una IA no responde a 3 avisos seguidos, se pausa 30 minutos y te aviso.</small></p></div>
+<div class="panel" data-t="inicio"><h2>🕰️ Reloj de la app (tiempo de las IA)</h2><p>Cambia la hora que las IA <b>creen</b> que es, cuando la consultan con <b>date.now</b>. Tu tiempo real no cambia, ni la velocidad real de los mensajes.</p><div id="ckst"></div><div class="row"><select id="cks"><option value="1">Ritmo normal</option><option value="0.5">Mitad de rápido</option><option value="0.25">Cuarta parte</option><option value="0.1">Diez veces más lento</option></select><select id="ckd"><option value="0">Sin atraso</option><option value="10">Atrasado 10 min</option><option value="30">Atrasado 30 min</option><option value="60">Atrasado 1 hora</option></select><button class="pri" id="ckon">Aplicar</button><button id="ckoff">Volver al real</button></div></div>
 <div class="panel" data-t="inicio"><h2>⏱️ Permiso temporal</h2><p>Cuando no estés, deja que algunas acciones se aprueben solas por un rato. Se apaga solo. Lo que no marques sigue pidiendo tu botón, y las preguntas super.approve siempre te las hacen a ti.</p><div id="gst"></div><div id="gtl"></div><div class="row"><select id="gh"><option value="1">1 hora</option><option value="2" selected>2 horas</option><option value="4">4 horas</option><option value="8">8 horas</option><option value="24">24 horas</option></select><button class="pri" id="gon">Activar permiso</button><button id="goff">Quitar ya</button></div><div class="err" id="gerr"></div></div>
 <div class="panel" data-t="conectores"><h2>🔌 Conectores</h2><p>Servidores y APIs a los que tus IA pueden llamar (con tu permiso). Las claves nunca se guardan aquí: se crean como secretos en Cloudflare con un nombre que empiece por CONN_.</p><div id="cls"></div></div>
 <div class="panel" data-t="conectores"><h2>➕ Añadir conector</h2><div class="row"><select id="cpre" style="flex:1"></select></div><div class="row"><input id="cn" placeholder="nombre (ej. render)" style="flex:1;min-width:140px"><select id="ck"></select></div><div class="row"><input id="cu" placeholder="https://tu-servidor.onrender.com" style="flex:1;min-width:220px"></div><div class="row"><input id="ce" placeholder="Secreto CONN_… (opcional)" style="flex:1;min-width:180px"><select id="cm"><option value="bearer">Authorization: Bearer</option><option value="none">Sin autenticación</option><option value="header:x-api-key">Header x-api-key</option><option value="query:key">Parámetro ?key=</option></select></div><div class="row"><input id="cnote" placeholder="Notas (opcional)" style="flex:1;min-width:160px"><button class="pri" id="cadd">Guardar</button></div><div class="err" id="cerr"></div><p><small>Para usar una clave: en Cloudflare → Workers → worker-js → Settings → Variables and Secrets, crea un secreto con el nombre que pongas arriba (empieza con CONN_). Los conectores de pagos solo los usa tu app: las IA no pueden llamarlos.</small></p></div>
@@ -1877,7 +1897,7 @@ function api(a,b){return fetch('/admin/api/'+a,{method:'POST',headers:{'content-
 function ago(t){var s=Math.max(0,(Date.now()-t)/1000);return s<60?'ahora':s<3600?Math.floor(s/60)+' min':s<86400?Math.floor(s/3600)+' h':Math.floor(s/86400)+' d'}
 function fill(box,rows,draw){box.replaceChildren();if(!rows.length){box.appendChild(el('p','Nada por ahora.'));return}rows.forEach(function(r){var d=el('div',null,'item');draw(d,r);box.appendChild(d)})}
 function refresh(){
- team();proj();avisos();conn();grant();wake();ctools();feed();
+ team();proj();avisos();conn();grant();wake();ctools();feed();clk();
  api('approvals').then(function(rows){fill($('#aps'),rows.filter(function(r){return r.status==='pending'}).concat(rows.filter(function(r){return r.status!=='pending'}).slice(0,5)),function(d,r){
   d.appendChild(el('b',r.tool+' · '+r.label+' · '+ago(r.created)));d.appendChild(el('span',' '+r.status,'tag'));d.appendChild(el('pre',r.args));
   if(r.status==='pending'){var w=el('div',null,'row');var a=el('button','Aprobar','ok'),n=el('button','Rechazar','no');
@@ -2110,6 +2130,10 @@ function feed(){api('feed',{limit:40}).then(function(d){FEEDW=d.working;['#dot1'
  $('#fst').replaceChildren(el('small',d.working?'🔵 Una IA está trabajando ahora mismo.':'Sin actividad en los últimos 90 segundos.'));
  var b=$('#feed');b.replaceChildren();if(!d.rows.length){b.appendChild(el('p','Nada por ahora.'));return}
  d.rows.forEach(function(r){var x=el('div',null,'fe'),ok=r.status==='ok';x.appendChild(el('b',(ok?'✓ ':r.status==='pending'?'⏳ ':'✗ ')+(r.label||'?')+' · '+r.tool));x.appendChild(el('span',' · hace '+ago(r.t)+' · '+(r.ms||0)+' ms','tag'));if(r.detail)x.appendChild(el('div',r.detail.slice(0,320),'')).className='';x.lastChild&&(x.lastChild.style&&(x.lastChild.style.color='var(--m)'));b.appendChild(x)})}).catch(function(){})}
+
+function clk(){api('clock-get').then(function(d){$('#ckst').replaceChildren(el('div',d.on?'🕰️ Activo: las IA ven '+new Date(d.app).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' (ritmo '+d.speed+', '+d.atraso_min+' min atrasado). La hora real es '+new Date(d.real).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'.':'Apagado: las IA ven la hora real.',d.on?'good':''))}).catch(fail)}
+$('#ckon').onclick=function(){api('clock-set',{speed:Number($('#cks').value),delay_min:Number($('#ckd').value)}).then(clk).catch(function(e){alert(e.message)})};
+$('#ckoff').onclick=function(){api('clock-off',{}).then(clk)};
 function openExt(id){api('preview-link',{id:id}).then(function(x){if(window.UABNative&&UABNative.openExternal){UABNative.openExternal(x.url)}else{window.open(x.url,'_blank','noopener')}}).catch(function(e){alert(e.message)})}
 $('#lext').onclick=function(){if(LIVE)openExt(LIVE.id)};
 var T0='inicio';try{T0=sessionStorage.getItem('uab_tab')||'inicio'}catch(e){}showTab(T0);
